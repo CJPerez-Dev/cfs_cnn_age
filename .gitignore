@@ -59,21 +59,14 @@ Thumbs.db
 # Logs
 *.log
 
-# Input and output data — users should supply their own files
+# ignore dirs
 input/
-
-# Output artifacts, trained models and reports (ignored)
 output/
-*.pt
-*.pth
 
-# Allow committed hyperparameter records folder (keep empty `.gitkeep` in repo)
-!output/hparams/
-!output/hparams/.gitkeep
-!output/hparams/*.json
-# Allow small README placeholders so empty folders appear in clones
+# but keep these
 !input/README.md
 !output/README.md
+!output/hparams/best_hyperparameters*.json
 
 # Temporary docs and exported images (optional)
 docs/_build/

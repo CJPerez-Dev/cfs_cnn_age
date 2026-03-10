@@ -1,0 +1,14 @@
+[
+  {
+    "hparams": {
+      "learning_rate": 0.0001,
+      "use_huber_loss": true,
+      "huber_beta": 0.7,
+      "max_windows_per_subject_per_epoch": 1200
+    },
+    "test_loss": 317.58917974172493,
+    "test_r2": 0.16103270110305545,
+    "test_mae": 14.998992839486975,
+    "trial_seconds": 121.23726940000051
+  }
+]

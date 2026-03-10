@@ -1,0 +1,242 @@
+[
+  {
+    "hparams": {
+      "learning_rate": 0.0001,
+      "use_huber_loss": true,
+      "huber_beta": 0.7,
+      "max_windows_per_subject_per_epoch": 1200
+    },
+    "test_loss": 298.7372164286864,
+    "test_r2": 0.2108282095008983,
+    "test_mae": 14.218028730057492,
+    "trial_seconds": 485.9850671000022
+  },
+  {
+    "hparams": {
+      "learning_rate": 0.0001,
+      "use_huber_loss": true,
+      "huber_beta": 0.7,
+      "max_windows_per_subject_per_epoch": 2000
+    },
+    "test_loss": 276.23236477864094,
+    "test_r2": 0.2702517830842043,
+    "test_mae": 13.630187538919676,
+    "trial_seconds": 622.3819089999997
+  },
+  {
+    "hparams": {
+      "learning_rate": 0.0001,
+      "use_huber_loss": true,
+      "huber_beta": 0.7,
+      "max_windows_per_subject_per_epoch": 3000
+    },
+    "test_loss": 278.08275458598746,
+    "test_r2": 0.2653640008666278,
+    "test_mae": 13.683682863270638,
+    "trial_seconds": 701.2952671999992
+  },
+  {
+    "hparams": {
+      "learning_rate": 0.0001,
+      "use_huber_loss": true,
+      "huber_beta": 1.0,
+      "max_windows_per_subject_per_epoch": 1200
+    },
+    "test_loss": 286.29554218802696,
+    "test_r2": 0.24371270398021738,
+    "test_mae": 14.070481017831971,
+    "trial_seconds": 271.0113053999994
+  },
+  {
+    "hparams": {
+      "learning_rate": 0.0001,
+      "use_huber_loss": true,
+      "huber_beta": 1.0,
+      "max_windows_per_subject_per_epoch": 2000
+    },
+    "test_loss": 275.42196393838293,
+    "test_r2": 0.2724084435333429,
+    "test_mae": 13.70112013198072,
+    "trial_seconds": 435.55836830000044
+  },
+  {
+    "hparams": {
+      "learning_rate": 0.0001,
+      "use_huber_loss": true,
+      "huber_beta": 1.0,
+      "max_windows_per_subject_per_epoch": 3000
+    },
+    "test_loss": 276.47628713754506,
+    "test_r2": 0.2696650994944434,
+    "test_mae": 13.772607331349194,
+    "trial_seconds": 631.3975136000008
+  },
+  {
+    "hparams": {
+      "learning_rate": 0.0001,
+      "use_huber_loss": true,
+      "huber_beta": 1.5,
+      "max_windows_per_subject_per_epoch": 1200
+    },
+    "test_loss": 289.0911525504711,
+    "test_r2": 0.23632569999303465,
+    "test_mae": 14.165576887597524,
+    "trial_seconds": 260.8276208999996
+  },
+  {
+    "hparams": {
+      "learning_rate": 0.0001,
+      "use_huber_loss": true,
+      "huber_beta": 1.5,
+      "max_windows_per_subject_per_epoch": 2000
+    },
+    "test_loss": 270.0517716206037,
+    "test_r2": 0.2865765812838802,
+    "test_mae": 13.60473487041799,
+    "trial_seconds": 397.01194570000007
+  },
+  {
+    "hparams": {
+      "learning_rate": 0.0001,
+      "use_huber_loss": true,
+      "huber_beta": 1.5,
+      "max_windows_per_subject_per_epoch": 3000
+    },
+    "test_loss": 266.73471481586114,
+    "test_r2": 0.29533306785969315,
+    "test_mae": 13.56459248544345,
+    "trial_seconds": 562.4957341000008
+  },
+  {
+    "hparams": {
+      "learning_rate": 0.0003,
+      "use_huber_loss": true,
+      "huber_beta": 0.7,
+      "max_windows_per_subject_per_epoch": 1200
+    },
+    "test_loss": 269.9582823918416,
+    "test_r2": 0.2868450399390837,
+    "test_mae": 13.359457101342228,
+    "trial_seconds": 236.84892010000112
+  },
+  {
+    "hparams": {
+      "learning_rate": 0.0003,
+      "use_huber_loss": true,
+      "huber_beta": 0.7,
+      "max_windows_per_subject_per_epoch": 2000
+    },
+    "test_loss": 262.03314062219397,
+    "test_r2": 0.30782139441749334,
+    "test_mae": 13.206942362967446,
+    "trial_seconds": 374.61802890000035
+  },
+  {
+    "hparams": {
+      "learning_rate": 0.0003,
+      "use_huber_loss": true,
+      "huber_beta": 0.7,
+      "max_windows_per_subject_per_epoch": 3000
+    },
+    "test_loss": 249.49109475398674,
+    "test_r2": 0.34092560763584967,
+    "test_mae": 12.734619548808949,
+    "trial_seconds": 577.0853287999998
+  },
+  {
+    "hparams": {
+      "learning_rate": 0.0003,
+      "use_huber_loss": true,
+      "huber_beta": 1.0,
+      "max_windows_per_subject_per_epoch": 1200
+    },
+    "test_loss": 268.5658869666931,
+    "test_r2": 0.29052144467869,
+    "test_mae": 13.479357022779402,
+    "trial_seconds": 242.24966380000114
+  },
+  {
+    "hparams": {
+      "learning_rate": 0.0003,
+      "use_huber_loss": true,
+      "huber_beta": 1.0,
+      "max_windows_per_subject_per_epoch": 2000
+    },
+    "test_loss": 262.3651865656559,
+    "test_r2": 0.306846136519771,
+    "test_mae": 13.268361771151755,
+    "trial_seconds": 384.99465190000046
+  },
+  {
+    "hparams": {
+      "learning_rate": 0.0003,
+      "use_huber_loss": true,
+      "huber_beta": 1.0,
+      "max_windows_per_subject_per_epoch": 3000
+    },
+    "test_loss": 245.67963425287834,
+    "test_r2": 0.35097901043935165,
+    "test_mae": 12.74950747388151,
+    "trial_seconds": 559.6166426000018
+  },
+  {
+    "hparams": {
+      "learning_rate": 0.0003,
+      "use_huber_loss": true,
+      "huber_beta": 1.5,
+      "max_windows_per_subject_per_epoch": 1200
+    },
+    "test_loss": 262.9802275189987,
+    "test_r2": 0.3052574815716834,
+    "test_mae": 13.36939346776591,
+    "trial_seconds": 237.81307110000125
+  },
+  {
+    "hparams": {
+      "learning_rate": 0.0003,
+      "use_huber_loss": true,
+      "huber_beta": 1.5,
+      "max_windows_per_subject_per_epoch": 2000
+    },
+    "test_loss": 253.12220024053866,
+    "test_r2": 0.33129627635770986,
+    "test_mae": 13.040066459855586,
+    "trial_seconds": 374.8871532999983
+  },
+  {
+    "hparams": {
+      "learning_rate": 0.0003,
+      "use_huber_loss": true,
+      "huber_beta": 1.5,
+      "max_windows_per_subject_per_epoch": 3000
+    },
+    "test_loss": 255.7781290674821,
+    "test_r2": 0.324388068383232,
+    "test_mae": 13.051213117102163,
+    "trial_seconds": 535.5452042999968
+  },
+  {
+    "hparams": {
+      "learning_rate": 0.0008,
+      "use_huber_loss": true,
+      "huber_beta": 0.7,
+      "max_windows_per_subject_per_epoch": 1200
+    },
+    "test_loss": 252.42899142671854,
+    "test_r2": 0.3331653984928832,
+    "test_mae": 12.753782201632898,
+    "trial_seconds": 232.80973829999857
+  },
+  {
+    "hparams": {
+      "learning_rate": 0.0008,
+      "use_huber_loss": true,
+      "huber_beta": 0.7,
+      "max_windows_per_subject_per_epoch": 2000
+    },
+    "test_loss": 235.7480912310955,
+    "test_r2": 0.3772133635284992,
+    "test_mae": 12.251153461879758,
+    "trial_seconds": 377.22582070000135
+  }
+]
