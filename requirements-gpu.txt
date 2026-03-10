@@ -1,0 +1,12 @@
+# GPU requirements (pinned to CUDA 13.0 / cu130).
+# Install with: pip install -r requirements-gpu.txt
+# The following extra-index and wheel are selected for CUDA 13.0 systems.
+--extra-index-url https://download.pytorch.org/whl/cu130
+torch==2.10.0+cu130
+
+numpy>=1.23.0
+matplotlib>=3.5.0
+tqdm>=4.64.0
+
+# If you need a different CUDA build, replace the `--extra-index-url` and
+# `torch` lines above with the appropriate PyTorch wheel for your platform.

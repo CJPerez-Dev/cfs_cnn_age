@@ -1,0 +1,12 @@
+# CPU-only requirements (self-contained).
+# Install with: pip install -r requirements-cpu.txt
+--index-url https://download.pytorch.org/whl/cpu
+torch>=2.0.0
+
+numpy>=1.23.0
+matplotlib>=3.5.0
+tqdm>=4.64.0
+
+# To pin an exact PyTorch build, replace the `torch` line above (for example:
+# torch==2.10.0+cpu) — otherwise a compatible CPU wheel will be selected from
+# the PyTorch CPU index.
