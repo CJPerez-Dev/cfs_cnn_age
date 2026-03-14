@@ -33,7 +33,24 @@ def _to_serializable(value):
     return value
 
 
-def get_default_hyperparameters(lr, use_huber_loss, huber_beta, max_windows_per_subject_per_epoch):
+def get_default_hyperparameters(
+    lr,
+    use_huber_loss,
+    huber_beta,
+    max_windows_per_subject_per_epoch,
+    cnn_embedding_dim=128,
+    cnn_dropout=0.0,
+    mil_attention_dim=128,
+    mil_attention_dropout=0.1,
+    mil_pooling_type="gated",
+    mil_bag_size=256,
+    mil_sampling_strategy="random",
+    mil_encoder_lr=1e-5,
+    mil_head_lr=5e-5,
+    mil_weight_decay=1e-2,
+    mil_regressor_hidden_dim=64,
+    mil_allow_replacement_when_small=True,
+):
     """Return baseline hyperparameters used when no tuned config exists.
 
     Args:
@@ -50,6 +67,18 @@ def get_default_hyperparameters(lr, use_huber_loss, huber_beta, max_windows_per_
         "use_huber_loss": use_huber_loss,
         "huber_beta": huber_beta,
         "max_windows_per_subject_per_epoch": max_windows_per_subject_per_epoch,
+        "cnn_embedding_dim": int(cnn_embedding_dim),
+        "cnn_dropout": float(cnn_dropout),
+        "mil_attention_dim": mil_attention_dim,
+        "mil_attention_dropout": mil_attention_dropout,
+        "mil_pooling_type": mil_pooling_type,
+        "mil_bag_size": mil_bag_size,
+        "mil_sampling_strategy": mil_sampling_strategy,
+        "mil_encoder_lr": mil_encoder_lr,
+        "mil_head_lr": mil_head_lr,
+        "mil_weight_decay": mil_weight_decay,
+        "mil_regressor_hidden_dim": mil_regressor_hidden_dim,
+        "mil_allow_replacement_when_small": bool(mil_allow_replacement_when_small),
     }
 
 
@@ -105,8 +134,8 @@ def save_best_hyperparameters(path, hparams, tuning_results=None):
         logger.info("Saved tuning trial results to: %s", results_path)
 
 
-def build_tuning_candidates(defaults):
-    """Generate a small grid of hyperparameter candidates for tuning mode.
+def build_tuning_candidates(defaults, model_mode="cnn"):
+    """Generate a model-mode aware hyperparameter candidate grid.
 
     Args:
         defaults (dict[str, Any]): Default hyperparameter configuration.
@@ -114,22 +143,131 @@ def build_tuning_candidates(defaults):
     Returns:
         list[dict[str, Any]]: Candidate hyperparameter dictionaries.
     """
+    mode = str(model_mode).strip().lower()
     candidates = []
-    for lr in [1e-4, 3e-4, 8e-4]:
-        for huber_beta in [0.7, 1.0, 1.5]:
-            for max_per_subj in [1200, 2000, 3000]:
-                candidates.append(
-                    {
-                        "learning_rate": lr,
-                        "use_huber_loss": True,
-                        "huber_beta": huber_beta,
-                        "max_windows_per_subject_per_epoch": max_per_subj,
-                    }
-                )
+
+    # CNN-focused dimensions.
+    cnn_lrs = [1e-4, 3e-4, 8e-4]
+    cnn_huber = [0.7, 1.0, 1.5]
+    cnn_max_per_subj = [512, 1024]
+    cnn_embedding_dims = [64, 128, 256]
+    cnn_dropouts = [0.0, 0.1, 0.2, 0.3, 0.5]
+
+    # MIL-focused dimensions.
+    mil_attention_dims = [64, 128, 256]
+    mil_attention_dropouts = [0.0, 0.1, 0.2]
+    mil_pooling_types = ["gated", "mean"]
+    mil_bag_sizes = [128, 256, 512]
+    mil_sampling_strategies = ["random", "sequential"]
+    mil_encoder_lrs = [1e-6, 1e-5]
+    mil_head_lrs = [1e-4, 1e-3]
+    mil_weight_decays = [1e-4, 1e-3, 1e-2]
+    mil_regressor_hidden_dims = [64, 128]
+
+    if mode in {"cnn", "both"}:
+        for lr in cnn_lrs:
+            for huber_beta in cnn_huber:
+                for max_per_subj in cnn_max_per_subj:
+                    for emb in cnn_embedding_dims:
+                        for dp in cnn_dropouts:
+                            base = defaults.copy()
+                            base.update(
+                                {
+                                    "learning_rate": lr,
+                                    "use_huber_loss": True,
+                                    "huber_beta": huber_beta,
+                                    "max_windows_per_subject_per_epoch": max_per_subj,
+                                    "cnn_embedding_dim": int(emb),
+                                    "cnn_dropout": float(dp),
+                                }
+                            )
+                            candidates.append(base)
+
+    if mode in {"mil", "both"}:
+        for attention_dim in mil_attention_dims:
+            for pooling in mil_pooling_types:
+                # Keep mean pooling simpler by not exploding its dropout axis.
+                dropout_grid = [0.0] if pooling == "mean" else mil_attention_dropouts
+                for attention_dropout in dropout_grid:
+                    for bag_size in mil_bag_sizes:
+                        for sampling_strategy in mil_sampling_strategies:
+                            for enc_lr in mil_encoder_lrs:
+                                for head_lr in mil_head_lrs:
+                                    for weight_decay in mil_weight_decays:
+                                        for reg_hidden in mil_regressor_hidden_dims:
+                                            base = defaults.copy()
+                                            base.update(
+                                                {
+                                                    "mil_attention_dim": attention_dim,
+                                                    "mil_attention_dropout": attention_dropout,
+                                                    "mil_pooling_type": pooling,
+                                                    "mil_bag_size": bag_size,
+                                                    "mil_sampling_strategy": sampling_strategy,
+                                                    "mil_encoder_lr": enc_lr,
+                                                    "mil_head_lr": head_lr,
+                                                    "mil_weight_decay": weight_decay,
+                                                    "mil_regressor_hidden_dim": reg_hidden,
+                                                }
+                                            )
+                                            candidates.append(base)
 
     if defaults not in candidates:
         candidates.append(defaults.copy())
     return candidates
+
+
+def build_optuna_candidate(defaults, trial, model_mode="cnn"):
+    """Build one hyperparameter candidate from an Optuna trial.
+
+    Args:
+        defaults (dict[str, Any]): Default hyperparameter dictionary.
+        trial: Optuna trial object with suggest_* methods.
+        model_mode (str): One of ``cnn``, ``mil``, or ``both``.
+
+    Returns:
+        dict[str, Any]: Candidate hyperparameter dictionary.
+    """
+    mode = str(model_mode).strip().lower()
+    candidate = defaults.copy()
+
+    if mode in {"cnn", "both"}:
+        candidate.update(
+            {
+                "learning_rate": float(trial.suggest_float("learning_rate", 1e-4, 8e-4, log=True)),
+                "use_huber_loss": True,
+                "huber_beta": float(trial.suggest_categorical("huber_beta", [0.7, 1.0, 1.5])),
+                "max_windows_per_subject_per_epoch": int(
+                    trial.suggest_categorical("max_windows_per_subject_per_epoch", [512, 1024])
+                ),
+                "cnn_embedding_dim": int(trial.suggest_categorical("cnn_embedding_dim", [64, 128, 256])),
+                "cnn_dropout": float(trial.suggest_categorical("cnn_dropout", [0.0, 0.1, 0.2, 0.3, 0.5])),
+            }
+        )
+
+    if mode in {"mil", "both"}:
+        pooling_type = str(trial.suggest_categorical("mil_pooling_type", ["gated", "mean"]))
+        if pooling_type == "mean":
+            attention_dropout = 0.0
+        else:
+            attention_dropout = float(trial.suggest_categorical("mil_attention_dropout", [0.0, 0.1, 0.2]))
+
+        candidate.update(
+            {
+                "mil_attention_dim": int(trial.suggest_categorical("mil_attention_dim", [64, 128, 256])),
+                "mil_attention_dropout": attention_dropout,
+                "mil_pooling_type": pooling_type,
+                "mil_bag_size": int(trial.suggest_categorical("mil_bag_size", [128, 256, 512])),
+                "mil_sampling_strategy": str(
+                    trial.suggest_categorical("mil_sampling_strategy", ["random", "sequential"])
+                ),
+                "mil_encoder_lr": float(trial.suggest_categorical("mil_encoder_lr", [1e-6, 1e-5])),
+                "mil_head_lr": float(trial.suggest_categorical("mil_head_lr", [1e-4, 1e-3])),
+                "mil_weight_decay": float(trial.suggest_categorical("mil_weight_decay", [1e-4, 1e-3, 1e-2])),
+                "mil_regressor_hidden_dim": int(trial.suggest_categorical("mil_regressor_hidden_dim", [64, 128])),
+            }
+        )
+
+    return candidate
 
 
 def save_run_summary(data_dir, summary_dict, run_tag):
@@ -223,3 +361,78 @@ def save_run_summary(data_dir, summary_dict, run_tag):
     logger.info("Run summary saved to: %s", txt_path)
     logger.info("Run summary JSON saved to: %s", json_path)
     return txt_path, json_path
+
+
+def save_model_comparison_summary(data_dir, run_tag, cnn_summary, mil_summary):
+    """Write JSON/TXT summary comparing baseline CNN and MIL runs.
+
+    Args:
+        data_dir (str): Destination directory for comparison artifacts.
+        run_tag (str): Timestamp tag used in comparison filenames.
+        cnn_summary (dict[str, Any]): Per-run summary payload for CNN.
+        mil_summary (dict[str, Any]): Per-run summary payload for MIL.
+
+    Returns:
+        tuple[str, str, dict[str, Any]]: ``(txt_path, json_path, payload)``.
+    """
+    metrics = [
+        ("test_mae", False),
+        ("test_r2", True),
+        ("subject_mae", False),
+        ("subject_r2", True),
+        ("best_train_loss", False),
+    ]
+
+    deltas = {}
+    for metric_name, _ in metrics:
+        cnn_value = float(cnn_summary.get(metric_name, np.nan))
+        mil_value = float(mil_summary.get(metric_name, np.nan))
+        delta = mil_value - cnn_value
+        deltas[metric_name] = {
+            "cnn": cnn_value,
+            "mil": mil_value,
+            "delta_mil_minus_cnn": float(delta) if np.isfinite(delta) else np.nan,
+        }
+
+    payload = {
+        "run_timestamp": run_tag,
+        "cnn": _to_serializable(cnn_summary),
+        "mil": _to_serializable(mil_summary),
+        "deltas": _to_serializable(deltas),
+    }
+
+    json_path = os.path.join(data_dir, f"cnn_mil_comparison_{run_tag}.json")
+    txt_path = os.path.join(data_dir, f"cnn_mil_comparison_{run_tag}.txt")
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+    lines = [
+        "CNN vs MIL Comparison",
+        "=" * 80,
+        f"Run Tag: {run_tag}",
+        "",
+    ]
+
+    for metric_name, higher_is_better in metrics:
+        cnn_value = deltas[metric_name]["cnn"]
+        mil_value = deltas[metric_name]["mil"]
+        delta = deltas[metric_name]["delta_mil_minus_cnn"]
+        if np.isfinite(delta):
+            if higher_is_better:
+                winner = "MIL" if delta > 0 else ("CNN" if delta < 0 else "Tie")
+            else:
+                winner = "MIL" if delta < 0 else ("CNN" if delta > 0 else "Tie")
+            lines.append(
+                f"{metric_name}: CNN={cnn_value:.6f} | MIL={mil_value:.6f} | "
+                f"delta(MIL-CNN)={delta:+.6f} | better={winner}"
+            )
+        else:
+            lines.append(f"{metric_name}: unavailable")
+
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+    logger.info("Model comparison summary saved to: %s", txt_path)
+    logger.info("Model comparison JSON saved to: %s", json_path)
+    return txt_path, json_path, payload

@@ -31,7 +31,8 @@ cfs_cnn_age/
 │  │  ├─ dataset.py              # Batch iterators + balanced sampling
 │  │  └─ preprocessing.py        # Normalization statistics
 │  ├─ models/
-│  │  └─ cnn_model.py            # EEG CNN model definition
+│  │  ├─ cnn_model.py            # EEG CNN model definition
+│  │  └─ mil.py                  # MIL encoder components (Step 1)
 │  ├─ training/
 │  │  ├─ losses.py               # Loss function selection
 │  │  └─ trainer.py              # Tuning + training loops
@@ -199,6 +200,25 @@ Run to see available CLI flags:
 python -m cnn_age_project.main --help
 ```
 
+Model execution modes:
+
+- `--model-mode cnn`: run baseline CNN pipeline only (default)
+- `--model-mode mil`: run MIL-enhanced pipeline only
+- `--model-mode both`: run CNN then MIL in one command and generate comparison artifacts
+
+Examples:
+
+```bash
+# Baseline CNN only
+python -m cnn_age_project.main --model-mode cnn
+
+# MIL only
+python -m cnn_age_project.main --model-mode mil --mil-pretrained-model path/to/cnn_weights.pt
+
+# Run both back-to-back and compare
+python -m cnn_age_project.main --model-mode both --mil-pretrained-model path/to/cnn_weights.pt
+```
+
 ## Configuration
 
 Most defaults are centralized in `cnn_age_project/config.py`, including:
@@ -210,6 +230,51 @@ Most defaults are centralized in `cnn_age_project/config.py`, including:
 
 For reproducibility, prefer editing config values in one place rather than
 scattering overrides across scripts.
+
+## Multiple Instance Learning (MIL) — High-Level Overview
+
+This repository includes a modular MIL implementation that reuses a
+pretrained EEG CNN as an instance encoder and learns to aggregate
+per-window embeddings into subject-level age predictions.
+
+- Instance encoder: the convolutional feature extractor from
+	`cnn_age_project/models/cnn_model.py` (produces a fixed-size embedding
+	for each EEG window).
+- Aggregation: a gated attention mechanism computes per-instance weights
+	from two parallel projections (a `tanh` branch and a `sigmoid` gate),
+	multiplies them elementwise, projects to a scalar score, and applies a
+	bag-local softmax to produce normalized attention weights.
+- Pseudo-bags and batching: training samples per-subject pseudo-bags
+	(random subsets of windows).
+- Bag regressor: an MLP maps the attention-weighted pooled embedding to
+	the final age prediction.
+
+Training modes and practices:
+
+- Encoder frozen: treat the CNN as a fixed feature extractor and train
+	only the attention head and regressor.
+- End-to-end fine-tune: unfreeze the encoder and jointly optimize the
+	encoder + attention + regressor. The trainer supports differential
+	learning rates (lower LR for pretrained encoder, higher LR for MIL
+	head) to stabilize fine-tuning.
+- Subject-wise safety: a runtime check enforces that train and test
+	subjects are disjoint to prevent leakage (see the data loader and
+	workflow integration).
+
+The MIL code is intentionally modular so the encoder, attention head,
+and regressor can be inspected or swapped independently.
+
+Defaults folder
+
+You can place repository-level fallback files into `defaults/` at the repo
+root. Supported filenames:
+
+- `default_model.pt` — pretrained CNN checkpoint used by MIL when no
+	`--mil-pretrained-model` is provided.
+- `default_hyperparameters.json` — default hyperparameters used when no
+	`--hparams-file` is provided.
+
+See `defaults/README.md` for more details.
 
 ## Using Hyperparameters and Tuning
 
@@ -291,3 +356,14 @@ The pipeline stores persistent outputs under `output/`.
 - Run summary text: `cnn_run_summary_<timestamp>.txt`
 - Training/evaluation figure: `cnn_training_report_<timestamp>.png`
 - Subject example figure: `cnn_subject_examples_<timestamp>.png`
+
+### Comparison artifacts (when `--model-mode both`)
+
+- `cnn_mil_comparison_<run_tag>.json`
+- `cnn_mil_comparison_<run_tag>.txt`
+- `cnn_mil_comparison_<run_tag>.png`
+
+Per-model artifacts are also organized into subfolders:
+
+- `output/<run_tag>/cnn/`
+- `output/<run_tag>/mil/`

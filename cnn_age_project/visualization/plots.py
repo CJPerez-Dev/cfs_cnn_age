@@ -165,3 +165,71 @@ def save_subject_examples_report(run_output_dir, run_tag, subject_report_save_na
     logger.info("Subject example report saved to: %s", subject_report_path)
     plt.close(fig2)
     return subject_report_path
+
+
+def save_model_comparison_report(run_output_dir, run_tag, cnn_summary, mil_summary):
+    """Save a side-by-side metric comparison chart for CNN vs MIL.
+
+    Args:
+        run_output_dir (str): Output directory for comparison artifacts.
+        run_tag (str): Timestamp tag used in output filename.
+        cnn_summary (dict[str, Any]): Summary payload for baseline CNN run.
+        mil_summary (dict[str, Any]): Summary payload for MIL run.
+
+    Returns:
+        str: Saved comparison figure path.
+    """
+    metrics = [
+        ("Test MAE", "test_mae", False),
+        ("Test R2", "test_r2", True),
+        ("Subject MAE", "subject_mae", False),
+        ("Subject R2", "subject_r2", True),
+    ]
+
+    cnn_values = [float(cnn_summary.get(key, np.nan)) for _, key, _ in metrics]
+    mil_values = [float(mil_summary.get(key, np.nan)) for _, key, _ in metrics]
+    labels = [name for name, _, _ in metrics]
+
+    x = np.arange(len(metrics), dtype=np.float32)
+    width = 0.35
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.bar(x - width / 2, cnn_values, width, label="CNN", color="#4E79A7")
+    ax.bar(x + width / 2, mil_values, width, label="MIL", color="#F28E2B")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=0)
+    ax.set_ylabel("Metric Value")
+    ax.set_title("CNN vs MIL Metric Comparison")
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.legend(loc="best")
+
+    summary_lines = []
+    for label, key, higher_is_better in metrics:
+        cnn_v = float(cnn_summary.get(key, np.nan))
+        mil_v = float(mil_summary.get(key, np.nan))
+        delta = mil_v - cnn_v
+        if np.isfinite(delta):
+            if higher_is_better:
+                verdict = "MIL better" if delta > 0 else ("CNN better" if delta < 0 else "Tie")
+            else:
+                verdict = "MIL better" if delta < 0 else ("CNN better" if delta > 0 else "Tie")
+            summary_lines.append(f"{label}: CNN={cnn_v:.4f} | MIL={mil_v:.4f} | delta={delta:+.4f} ({verdict})")
+
+    if summary_lines:
+        ax.text(
+            0.01,
+            0.99,
+            "\n".join(summary_lines),
+            transform=ax.transAxes,
+            verticalalignment="top",
+            fontsize=9,
+            bbox=dict(facecolor="white", alpha=0.85),
+        )
+
+    plt.tight_layout()
+    path = os.path.join(run_output_dir, f"cnn_mil_comparison_{run_tag}.png")
+    plt.savefig(path, dpi=300)
+    logger.info("CNN vs MIL comparison report saved to: %s", path)
+    plt.close(fig)
+    return path

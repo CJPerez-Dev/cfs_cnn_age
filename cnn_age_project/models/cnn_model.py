@@ -4,34 +4,48 @@ import torch.nn as nn
 
 
 class EEGCNN(nn.Module):
-    """1D CNN regressor that predicts age from single-channel EEG windows."""
+    """1D CNN regressor that predicts age from single-channel EEG windows.
 
-    def __init__(self, input_length):
+    This implementation exposes two tunable parameters used by the tuner:
+    - `embedding_dim`: number of output channels from the final conv block (encoder dim)
+    - `dropout`: CNN dropout applied after each activation
+    """
+
+    def __init__(self, input_length, embedding_dim: int = 128, dropout: float = 0.0):
         """Initialize convolutional feature extractor and regression head.
 
         Args:
             input_length (int): Input window length in samples (kept for API clarity).
+            embedding_dim (int): Final feature/channel dimension output by the encoder.
+            dropout (float): Dropout probability applied after activations.
 
         Returns:
             None
         """
         super().__init__()
 
+        dp = float(dropout)
+        drop_layer = nn.Dropout(dp) if dp > 0.0 else nn.Identity()
+
+        # Keep intermediate channel progression modest; final out channels = embedding_dim
         self.features = nn.Sequential(
             nn.Conv1d(1, 32, kernel_size=7, padding=3),
             nn.ReLU(),
+            drop_layer,
             nn.MaxPool1d(2),
             nn.Conv1d(32, 64, kernel_size=7, padding=3),
             nn.ReLU(),
+            drop_layer,
             nn.MaxPool1d(2),
-            nn.Conv1d(64, 128, kernel_size=7, padding=3),
+            nn.Conv1d(64, int(embedding_dim), kernel_size=7, padding=3),
             nn.ReLU(),
+            drop_layer,
             nn.MaxPool1d(2),
             nn.AdaptiveAvgPool1d(1),
         )
 
         self.regressor = nn.Sequential(
-            nn.Linear(128, 64),
+            nn.Linear(int(embedding_dim), 64),
             nn.ReLU(),
             nn.Linear(64, 1),
         )

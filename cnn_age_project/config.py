@@ -44,6 +44,15 @@ class Config:
     subject_example_count: int = 32
     subject_example_max_windows: int = 300
 
+    mil_pseudo_bag_size: int = 256
+    mil_pseudo_bag_min_windows: int = 256
+    mil_pseudo_bag_max_windows: int = 256
+    mil_allow_replacement_when_small: bool = True
+    mil_bag_batch_size: int = 16
+    mil_finetune_encoder_lr: float = 1e-5
+    mil_finetune_head_lr: float = 5e-5
+    mil_finetune_weight_decay: float = 1e-2
+
     log_level: str = "INFO"
     debug_chunk_log_every: int = 10
 
@@ -65,6 +74,11 @@ class Config:
     run_summary_history_dir: str = "run_summaries"
     best_hparams_file: str = "best_hyperparameters.json"
     tuning_results_file: str = "tuning_results.json"
+
+    # Defaults folder for repository-provided fallbacks (user may populate)
+    defaults_dir_name: str = "defaults"
+    default_model_file: str = "default_model.pt"
+    default_hparams_file: str = "default_hyperparameters.json"
 
     @property
     def input_dir(self):
@@ -158,6 +172,15 @@ RANDOM_SEED = CONFIG.random_seed
 SUBJECT_EXAMPLE_COUNT = CONFIG.subject_example_count
 SUBJECT_EXAMPLE_MAX_WINDOWS = CONFIG.subject_example_max_windows
 
+MIL_PSEUDO_BAG_SIZE = CONFIG.mil_pseudo_bag_size
+MIL_PSEUDO_BAG_MIN_WINDOWS = CONFIG.mil_pseudo_bag_min_windows
+MIL_PSEUDO_BAG_MAX_WINDOWS = CONFIG.mil_pseudo_bag_max_windows
+MIL_ALLOW_REPLACEMENT_WHEN_SMALL = CONFIG.mil_allow_replacement_when_small
+MIL_BAG_BATCH_SIZE = CONFIG.mil_bag_batch_size
+MIL_FINETUNE_ENCODER_LR = CONFIG.mil_finetune_encoder_lr
+MIL_FINETUNE_HEAD_LR = CONFIG.mil_finetune_head_lr
+MIL_FINETUNE_WEIGHT_DECAY = CONFIG.mil_finetune_weight_decay
+
 LOG_LEVEL = CONFIG.log_level
 DEBUG_CHUNK_LOG_EVERY = CONFIG.debug_chunk_log_every
 
@@ -179,3 +202,8 @@ RUN_SUMMARY_JSON_NAME = CONFIG.run_summary_json_name
 RUN_SUMMARY_HISTORY_DIR = CONFIG.run_summary_history_dir
 BEST_HPARAMS_FILE = CONFIG.best_hparams_file
 TUNING_RESULTS_FILE = CONFIG.tuning_results_file
+
+# Defaults folder and file paths (user-editable fallbacks)
+DEFAULTS_DIR = os.path.join(PROJECT_DIR, CONFIG.defaults_dir_name)
+DEFAULT_MODEL_PATH = os.path.join(DEFAULTS_DIR, CONFIG.default_model_file)
+DEFAULT_HPARAMS_PATH = os.path.join(DEFAULTS_DIR, CONFIG.default_hparams_file)

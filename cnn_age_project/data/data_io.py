@@ -34,6 +34,46 @@ def load_subject_age_map(csv_path):
     return subject_age
 
 
+def validate_subject_wise_split_integrity(
+    train_indices,
+    test_indices,
+    subject_codes,
+    subject_codebook,
+):
+    """Assert train/test subject separation for generalization-safe evaluation.
+
+    Args:
+        train_indices (np.ndarray): Window indices in train split.
+        test_indices (np.ndarray): Window indices in test split.
+        subject_codes (np.ndarray | np.memmap): Subject code per window index.
+        subject_codebook (list[str]): Code-to-subject-id mapping.
+
+    Returns:
+        tuple[set[int], set[int]]: ``(train_subject_codes, test_subject_codes)``.
+    """
+    train_subject_codes = set(np.asarray(subject_codes[train_indices], dtype=np.int32).tolist())
+    test_subject_codes = set(np.asarray(subject_codes[test_indices], dtype=np.int32).tolist())
+
+    train_subject_codes.discard(-1)
+    test_subject_codes.discard(-1)
+
+    overlap_codes = train_subject_codes.intersection(test_subject_codes)
+    if overlap_codes:
+        overlap_subjects = [subject_codebook[code] for code in sorted(overlap_codes) if 0 <= code < len(subject_codebook)]
+        preview = overlap_subjects[:10]
+        raise ValueError(
+            "Subject-wise split integrity failed: train/test leakage detected for "
+            f"{len(overlap_codes)} subjects. Example subject IDs: {preview}"
+        )
+
+    logger.info(
+        "Subject-wise split integrity passed | train_subjects=%d | test_subjects=%d | overlap=0",
+        len(train_subject_codes),
+        len(test_subject_codes),
+    )
+    return train_subject_codes, test_subject_codes
+
+
 def _missing_files(folder_path, required_names):
     """Return names from required_names that are missing in folder_path.
 

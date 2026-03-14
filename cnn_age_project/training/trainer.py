@@ -8,13 +8,585 @@ import numpy as np
 import torch
 import torch.optim as optim
 
-from cnn_age_project.data.dataset import iter_memmap_batches, sample_balanced_train_indices
+from cnn_age_project.data.dataset import (
+    iter_subject_pseudo_bag_batches,
+    iter_memmap_batches,
+    sample_balanced_train_indices,
+    sample_epoch_subject_pseudo_bags,
+)
 from cnn_age_project.evaluation.evaluation import run_epoch_metrics
 from cnn_age_project.models.cnn_model import EEGCNN
+from cnn_age_project.models.mil import MILAgeRegressor, MILInstanceEncoder, summarize_parameter_counts
 from cnn_age_project.training.losses import get_loss_function
 from cnn_age_project.utils.utils import make_tqdm
 
 logger = logging.getLogger(__name__)
+
+
+def prepare_mil_instance_encoder(
+    window_len,
+    device,
+    freeze_encoder=True,
+    base_cnn_state_dict=None,
+    cnn_embedding_dim: int = 128,
+    cnn_dropout: float = 0.0,
+):
+    """Prepare MIL Step 1 encoder by stripping CNN head and freezing features.
+
+    Args:
+        window_len (int): Input window length used by the CNN architecture.
+        device (torch.device): Device where encoder will be placed.
+        freeze_encoder (bool): If True, disable encoder gradients.
+        base_cnn_state_dict (dict[str, torch.Tensor] | None): Optional pretrained
+            EEGCNN weights. If provided, they are loaded before encoder extraction.
+
+    Returns:
+        MILInstanceEncoder: MIL-ready instance encoder module.
+    """
+    logger.info(
+        "Preparing MIL instance encoder (Step 1) | freeze_encoder=%s | has_pretrained_weights=%s",
+        freeze_encoder,
+        base_cnn_state_dict is not None,
+    )
+
+    base_cnn = EEGCNN(window_len, embedding_dim=cnn_embedding_dim, dropout=cnn_dropout)
+    if base_cnn_state_dict is not None:
+        missing, unexpected = base_cnn.load_state_dict(base_cnn_state_dict, strict=False)
+        logger.info(
+            "Loaded base CNN state dict for MIL encoder | missing_keys=%d | unexpected_keys=%d",
+            len(missing),
+            len(unexpected),
+        )
+        if missing:
+            logger.warning("Missing CNN keys while loading for MIL encoder: %s", missing)
+        if unexpected:
+            logger.warning("Unexpected CNN keys while loading for MIL encoder: %s", unexpected)
+
+    encoder = MILInstanceEncoder.from_eegcnn(base_cnn, freeze_encoder=freeze_encoder).to(device)
+    total_params, trainable_params = summarize_parameter_counts(encoder)
+    logger.info(
+        "MIL Step 1 complete | encoder_params=%d | trainable_params=%d | frozen=%s",
+        total_params,
+        trainable_params,
+        freeze_encoder,
+    )
+    return encoder
+
+
+def build_mil_gated_attention_model(
+    window_len,
+    device,
+    freeze_encoder=True,
+    base_cnn_state_dict=None,
+    feature_dim=128,
+    cnn_embedding_dim: int = 128,
+    cnn_dropout: float = 0.0,
+    attention_dim=128,
+    regressor_hidden_dim=64,
+    pooling_type="gated",
+    attention_dropout=0.0,
+):
+    """Construct Step 2 MIL model with gated attention on top of encoder.
+
+    Args:
+        window_len (int): Input window length.
+        device (torch.device): Device where model is allocated.
+        freeze_encoder (bool): Freeze CNN encoder parameters if True.
+        base_cnn_state_dict (dict[str, torch.Tensor] | None): Optional pretrained
+            base CNN state dict loaded prior to encoder extraction.
+        feature_dim (int): Encoder embedding size.
+        attention_dim (int): Gated attention hidden size.
+        regressor_hidden_dim (int): Bag-level regressor hidden size.
+        pooling_type (str): Bag pooling strategy, ``gated`` or ``mean``.
+        attention_dropout (float): Dropout within gated attention features.
+
+    Returns:
+        MILAgeRegressor: MIL age regressor with gated attention.
+    """
+    encoder = prepare_mil_instance_encoder(
+        window_len=window_len,
+        device=device,
+        freeze_encoder=freeze_encoder,
+        base_cnn_state_dict=base_cnn_state_dict,
+        cnn_embedding_dim=cnn_embedding_dim,
+        cnn_dropout=cnn_dropout,
+    )
+
+    mil_model = MILAgeRegressor(
+        instance_encoder=encoder,
+        feature_dim=feature_dim,
+        attention_dim=attention_dim,
+        regressor_hidden_dim=regressor_hidden_dim,
+        pooling_type=pooling_type,
+        attention_dropout=attention_dropout,
+    ).to(device)
+
+    total_params, trainable_params = summarize_parameter_counts(mil_model)
+    logger.info(
+        "Step 2 MIL model ready | total_params=%d | trainable_params=%d | "
+        "feature_dim=%d attention_dim=%d regressor_hidden_dim=%d pooling_type=%s attention_dropout=%.3f",
+        total_params,
+        trainable_params,
+        feature_dim,
+        attention_dim,
+        regressor_hidden_dim,
+        pooling_type,
+        float(attention_dropout),
+    )
+    return mil_model
+
+
+def sample_mil_epoch_pseudo_bags(
+    balanced_sorted_indices,
+    balanced_offsets,
+    balanced_counts,
+    rng,
+    pseudo_bag_min_windows=256,
+    pseudo_bag_max_windows=500,
+    allow_replacement_when_small=True,
+    sampling_strategy="random",
+):
+    """Sample one random pseudo-bag per subject for MIL epoch training.
+
+    Args:
+        balanced_sorted_indices (np.ndarray): Subject-sorted train indices.
+        balanced_offsets (np.ndarray): Per-subject offset boundaries.
+        balanced_counts (np.ndarray): Per-subject train-window counts.
+        rng (np.random.Generator): Random generator for reproducible sampling.
+        pseudo_bag_min_windows (int): Lower bound for sampled bag size.
+        pseudo_bag_max_windows (int): Upper bound for sampled bag size.
+        allow_replacement_when_small (bool): Whether to sample with replacement
+            when a subject has fewer windows than requested bag size.
+        sampling_strategy (str): ``random`` or ``sequential`` bag sampling.
+
+    Returns:
+        list[tuple[int, np.ndarray]]: Subject pseudo-bags for the epoch.
+    """
+    pseudo_bags = sample_epoch_subject_pseudo_bags(
+        sorted_indices=balanced_sorted_indices,
+        offsets=balanced_offsets,
+        counts=balanced_counts,
+        rng=rng,
+        min_windows=pseudo_bag_min_windows,
+        max_windows=pseudo_bag_max_windows,
+        allow_replacement_when_small=allow_replacement_when_small,
+        sampling_strategy=sampling_strategy,
+    )
+
+    bag_sizes = np.asarray([bag_indices.size for _, bag_indices in pseudo_bags], dtype=np.int32)
+    if bag_sizes.size == 0:
+        logger.warning("MIL pseudo-bag sampler produced zero bags for this epoch.")
+        return pseudo_bags
+
+    logger.info(
+        "MIL pseudo-bags sampled | n_bags=%d | bag_size[min/median/max]=%d/%d/%d | range=[%d,%d]",
+        bag_sizes.size,
+        int(bag_sizes.min()),
+        int(np.median(bag_sizes)),
+        int(bag_sizes.max()),
+        pseudo_bag_min_windows,
+        pseudo_bag_max_windows,
+    )
+    return pseudo_bags
+
+
+def build_mil_pseudo_bag_batch_iterator(
+    x_mem,
+    y_mem,
+    pseudo_bags,
+    batch_size,
+    x_mean=0.0,
+    x_std=1.0,
+):
+    """Create iterator that yields MIL pseudo-bag mini-batches.
+
+    Args:
+        x_mem (np.memmap): Input windows.
+        y_mem (np.memmap): Window-level age targets.
+        pseudo_bags (list[tuple[int, np.ndarray]]): Sampled bags for this epoch.
+        batch_size (int): Number of subject bags per mini-batch.
+        x_mean (float): Input normalization mean.
+        x_std (float): Input normalization std.
+
+    Returns:
+        Iterator: Yields ``(x_bags, y_bags, subject_codes, bag_mask)`` tuples.
+    """
+    n_bags = len(pseudo_bags)
+    n_batches = (n_bags + batch_size - 1) // max(1, batch_size)
+    logger.info("Building MIL pseudo-bag iterator | n_bags=%d | batch_size=%d | n_batches=%d", n_bags, batch_size, n_batches)
+    return iter_subject_pseudo_bag_batches(
+        x_mem=x_mem,
+        y_mem=y_mem,
+        pseudo_bags=pseudo_bags,
+        batch_size=batch_size,
+        x_mean=x_mean,
+        x_std=x_std,
+    )
+
+
+def configure_mil_finetune_optimizer(
+    mil_model,
+    device,
+    encoder_learning_rate=1e-5,
+    mil_head_learning_rate=5e-5,
+    weight_decay=1e-2,
+):
+    """Configure Step 3 optimizer with differential learning rates.
+
+    Args:
+        mil_model (MILAgeRegressor): MIL model to optimize.
+        device (torch.device): Device used to determine fused optimizer support.
+        encoder_learning_rate (float): Learning rate for CNN encoder params.
+        mil_head_learning_rate (float): Learning rate for attention/regressor params.
+        weight_decay (float): AdamW weight decay.
+
+    Returns:
+        torch.optim.Optimizer: Configured AdamW optimizer.
+    """
+    mil_model.set_encoder_trainable(True)
+
+    encoder_params = [p for p in mil_model.instance_encoder.parameters() if p.requires_grad]
+    encoder_param_ids = {id(p) for p in encoder_params}
+    mil_head_params = [
+        p
+        for p in mil_model.parameters()
+        if p.requires_grad and id(p) not in encoder_param_ids
+    ]
+
+    n_encoder_params = int(sum(p.numel() for p in encoder_params))
+    n_head_params = int(sum(p.numel() for p in mil_head_params))
+    if (n_encoder_params + n_head_params) == 0:
+        raise ValueError("No trainable parameters detected for MIL fine-tuning.")
+
+    param_groups = []
+    if encoder_params:
+        param_groups.append({"params": encoder_params, "lr": float(encoder_learning_rate)})
+    if mil_head_params:
+        param_groups.append({"params": mil_head_params, "lr": float(mil_head_learning_rate)})
+
+    optimizer = optim.AdamW(
+        param_groups,
+        lr=float(mil_head_learning_rate),
+        weight_decay=float(weight_decay),
+        fused=(device.type == "cuda"),
+    )
+
+    logger.info(
+        "MIL Step 3 optimizer configured | encoder_lr=%.2e head_lr=%.2e "
+        "encoder_trainable_params=%d head_trainable_params=%d weight_decay=%.4g",
+        encoder_learning_rate,
+        mil_head_learning_rate,
+        n_encoder_params,
+        n_head_params,
+        weight_decay,
+    )
+    return optimizer
+
+
+def run_mil_finetune_training(
+    mil_model,
+    criterion,
+    optimizer,
+    scaler,
+    device,
+    x_mem,
+    y_mem,
+    balanced_sorted_indices,
+    balanced_offsets,
+    balanced_counts,
+    rng,
+    epochs,
+    bag_batch_size,
+    x_mean,
+    x_std,
+    y_mean,
+    y_std,
+    normalize_target,
+    pseudo_bag_min_windows,
+    pseudo_bag_max_windows,
+    allow_replacement_when_small,
+    sampling_strategy,
+    debug_chunk_log_every,
+    amp_enabled,
+):
+    """Run Step 3 full-model fine-tuning over stochastic pseudo-bags.
+
+    Args:
+        mil_model (MILAgeRegressor): MIL model (encoder + attention + regressor).
+        criterion (torch.nn.Module): Loss criterion.
+        optimizer (torch.optim.Optimizer): Optimizer with parameter groups.
+        scaler (torch.amp.GradScaler): Gradient scaler for AMP.
+        device (torch.device): Execution device.
+        x_mem (np.memmap): Input windows.
+        y_mem (np.memmap): Age targets.
+        balanced_sorted_indices (np.ndarray): Subject-sorted train indices.
+        balanced_offsets (np.ndarray): Per-subject offsets.
+        balanced_counts (np.ndarray): Per-subject counts.
+        rng (np.random.Generator): RNG for pseudo-bag sampling.
+        epochs (int): Number of fine-tuning epochs.
+        bag_batch_size (int): Number of bags per optimizer step.
+        x_mean (float): Input normalization mean.
+        x_std (float): Input normalization std.
+        y_mean (float): Target normalization mean.
+        y_std (float): Target normalization std.
+        normalize_target (bool): If True, train in normalized age space.
+        pseudo_bag_min_windows (int): Minimum pseudo-bag size.
+        pseudo_bag_max_windows (int): Maximum pseudo-bag size.
+        allow_replacement_when_small (bool): Whether small subjects are sampled
+            with replacement to meet bag size.
+        sampling_strategy (str): ``random`` or ``sequential`` pseudo-bag sampling.
+        debug_chunk_log_every (int): Debug logging cadence.
+        amp_enabled (bool): Whether AMP autocast/scaler are enabled.
+
+    Returns:
+        dict[str, Any]: Fine-tuning history and best-epoch metadata.
+    """
+    train_losses = []
+    maes = []
+    r2_scores = []
+    best_loss = float("inf")
+    best_epoch = 0
+    best_state_dict = None
+
+    for epoch in range(epochs):
+        mil_model.train()
+
+        pseudo_bags = sample_mil_epoch_pseudo_bags(
+            balanced_sorted_indices=balanced_sorted_indices,
+            balanced_offsets=balanced_offsets,
+            balanced_counts=balanced_counts,
+            rng=rng,
+            pseudo_bag_min_windows=pseudo_bag_min_windows,
+            pseudo_bag_max_windows=pseudo_bag_max_windows,
+            allow_replacement_when_small=allow_replacement_when_small,
+            sampling_strategy=sampling_strategy,
+        )
+        if len(pseudo_bags) == 0:
+            raise ValueError("MIL fine-tuning received zero pseudo-bags. Check subject grouping inputs.")
+
+        n_batches = (len(pseudo_bags) + bag_batch_size - 1) // bag_batch_size
+        batch_iter = build_mil_pseudo_bag_batch_iterator(
+            x_mem=x_mem,
+            y_mem=y_mem,
+            pseudo_bags=pseudo_bags,
+            batch_size=bag_batch_size,
+            x_mean=x_mean,
+            x_std=x_std,
+        )
+        pbar = make_tqdm(
+            batch_iter,
+            total=n_batches,
+            desc=f"MIL FineTune {epoch + 1}/{epochs}",
+            unit="batch",
+            position=0,
+            leave=True,
+        )
+
+        running_loss = 0.0
+        metric_abs_error = 0.0
+        metric_sse = 0.0
+        metric_sum_y = 0.0
+        metric_sum_y2 = 0.0
+        metric_n = 0
+
+        for batch_num, (x_bags, y_bags, _, bag_mask) in enumerate(pbar, start=1):
+            x_bags = x_bags.to(device, non_blocking=True)
+            y_bags = y_bags.to(device, non_blocking=True)
+            bag_mask = bag_mask.to(device, non_blocking=True)
+
+            if normalize_target:
+                y_model = (y_bags - y_mean) / y_std
+            else:
+                y_model = y_bags
+
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast("cuda", enabled=amp_enabled):
+                outputs = mil_model(x_bags, bag_mask=bag_mask)
+                loss = criterion(outputs, y_model)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            outputs_year = outputs * y_std + y_mean if normalize_target else outputs
+            loss_year = torch.mean((outputs_year - y_bags) ** 2)
+            running_loss += float(loss_year.item())
+
+            outputs_np = outputs_year.detach().float().cpu().numpy()
+            targets_np = y_bags.detach().float().cpu().numpy()
+            diff = targets_np - outputs_np
+
+            metric_abs_error += float(np.abs(diff).sum())
+            metric_sse += float(np.square(diff).sum())
+            metric_sum_y += float(targets_np.sum())
+            metric_sum_y2 += float(np.square(targets_np).sum())
+            metric_n += targets_np.shape[0]
+
+            if (batch_num % debug_chunk_log_every) == 0:
+                logger.debug(
+                    "MIL fine-tune epoch %d batch %d/%d | running_loss=%.4f running_mae=%.4f",
+                    epoch + 1,
+                    batch_num,
+                    n_batches,
+                    running_loss / max(1, batch_num),
+                    metric_abs_error / max(1, metric_n),
+                )
+
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+        avg_loss = running_loss / max(1, n_batches)
+        mae = metric_abs_error / max(1, metric_n)
+        y_bar = metric_sum_y / max(1, metric_n)
+        sst = metric_sum_y2 - (metric_n * y_bar * y_bar)
+        r2 = (1.0 - (metric_sse / sst)) if sst > 0 else np.nan
+
+        train_losses.append(avg_loss)
+        maes.append(mae)
+        r2_scores.append(r2)
+
+        logger.info(
+            "MIL fine-tune epoch %d | loss=%.4f | mae=%.3f | r2=%.4f",
+            epoch + 1,
+            avg_loss,
+            mae,
+            r2,
+        )
+
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            best_epoch = epoch + 1
+            best_state_dict = {key: value.detach().cpu().clone() for key, value in mil_model.state_dict().items()}
+
+    if best_state_dict is not None:
+        mil_model.load_state_dict(best_state_dict)
+        logger.info("MIL fine-tune restored best model weights from epoch %d.", best_epoch)
+
+    return {
+        "model": mil_model,
+        "train_losses": train_losses,
+        "maes": maes,
+        "r2_scores": r2_scores,
+        "best_loss": best_loss,
+        "best_epoch": best_epoch,
+    }
+
+
+def evaluate_mil_on_subject_bags(
+    mil_model,
+    criterion,
+    x_mem,
+    y_mem,
+    eval_indices,
+    subject_codes,
+    n_subjects,
+    batch_size,
+    device,
+    x_mean,
+    x_std,
+    y_mean,
+    y_std,
+    normalize_target,
+    rng,
+    pseudo_bag_min_windows,
+    pseudo_bag_max_windows,
+    allow_replacement_when_small,
+    sampling_strategy,
+):
+    """Evaluate MIL model using one pseudo-bag per subject from eval split.
+
+    Returns:
+        dict[str, Any]: loss/r2/mae plus arrays and subject aggregations.
+    """
+    from cnn_age_project.data.dataset import build_subject_group_index  # local import avoids cycles
+
+    mil_model.eval()
+
+    sorted_idx, offsets, counts = build_subject_group_index(
+        train_indices=eval_indices,
+        subject_codes=subject_codes,
+        n_subjects=n_subjects,
+    )
+
+    pseudo_bags = sample_mil_epoch_pseudo_bags(
+        balanced_sorted_indices=sorted_idx,
+        balanced_offsets=offsets,
+        balanced_counts=counts,
+        rng=rng,
+        pseudo_bag_min_windows=pseudo_bag_min_windows,
+        pseudo_bag_max_windows=pseudo_bag_max_windows,
+        allow_replacement_when_small=allow_replacement_when_small,
+        sampling_strategy=sampling_strategy,
+    )
+    if len(pseudo_bags) == 0:
+        raise ValueError("MIL evaluation produced zero pseudo-bags on eval split.")
+
+    n_batches = (len(pseudo_bags) + batch_size - 1) // batch_size
+    batch_iter = build_mil_pseudo_bag_batch_iterator(
+        x_mem=x_mem,
+        y_mem=y_mem,
+        pseudo_bags=pseudo_bags,
+        batch_size=batch_size,
+        x_mean=x_mean,
+        x_std=x_std,
+    )
+
+    running_loss = 0.0
+    pred_chunks = []
+    true_chunks = []
+    sum_true_by_subject = np.zeros((n_subjects,), dtype=np.float64)
+    sum_pred_by_subject = np.zeros((n_subjects,), dtype=np.float64)
+    count_by_subject = np.zeros((n_subjects,), dtype=np.int64)
+
+    with torch.no_grad():
+        for x_bags, y_bags, bag_subject_codes, bag_mask in batch_iter:
+            x_bags = x_bags.to(device, non_blocking=True)
+            y_bags = y_bags.to(device, non_blocking=True)
+            bag_mask = bag_mask.to(device, non_blocking=True)
+
+            y_model = (y_bags - y_mean) / y_std if normalize_target else y_bags
+            outputs = mil_model(x_bags, bag_mask=bag_mask)
+            loss = criterion(outputs, y_model)
+
+            outputs_year = outputs * y_std + y_mean if normalize_target else outputs
+            mse_year = torch.mean((outputs_year - y_bags) ** 2)
+            running_loss += float(mse_year.item())
+
+            pred_np = outputs_year.detach().float().cpu().numpy()
+            true_np = y_bags.detach().float().cpu().numpy()
+            pred_chunks.append(pred_np)
+            true_chunks.append(true_np)
+
+            for subj_code, true_value, pred_value in zip(bag_subject_codes, true_np, pred_np):
+                subj_idx = int(subj_code)
+                if subj_idx < 0 or subj_idx >= n_subjects:
+                    continue
+                sum_true_by_subject[subj_idx] += float(true_value)
+                sum_pred_by_subject[subj_idx] += float(pred_value)
+                count_by_subject[subj_idx] += 1
+
+    final_preds = np.concatenate(pred_chunks) if pred_chunks else np.array([], dtype=np.float32)
+    final_targets = np.concatenate(true_chunks) if true_chunks else np.array([], dtype=np.float32)
+    if final_targets.size == 0:
+        raise ValueError("MIL evaluation produced no predictions.")
+
+    diff = final_targets - final_preds
+    mae = float(np.mean(np.abs(diff)))
+    sse = float(np.sum(np.square(diff)))
+    centered = final_targets - float(np.mean(final_targets))
+    sst = float(np.sum(np.square(centered)))
+    r2 = (1.0 - (sse / sst)) if sst > 0 else np.nan
+    avg_loss = running_loss / max(1, n_batches)
+
+    return {
+        "test_loss": float(avg_loss),
+        "test_r2": float(r2) if np.isfinite(r2) else np.nan,
+        "test_mae": float(mae),
+        "final_targets": final_targets,
+        "final_preds": final_preds,
+        "sum_true_by_subject": sum_true_by_subject,
+        "sum_pred_by_subject": sum_pred_by_subject,
+        "count_by_subject": count_by_subject,
+    }
 
 
 def setup_model_and_optimizers(
@@ -26,6 +598,8 @@ def setup_model_and_optimizers(
     use_huber_loss,
     huber_beta,
     learning_rate,
+    cnn_embedding_dim: int = 128,
+    cnn_dropout: float = 0.0,
 ):
     """Build model/loss/optimizer/scaler and optionally apply torch.compile.
 
@@ -42,7 +616,7 @@ def setup_model_and_optimizers(
     Returns:
         tuple: ``(model, criterion, optimizer, scaler, amp_enabled, triton_available, compile_applied)``.
     """
-    model = EEGCNN(window_len)
+    model = EEGCNN(window_len, embedding_dim=cnn_embedding_dim, dropout=cnn_dropout)
     model = model.to(device)
 
     triton_available = importlib.util.find_spec("triton") is not None
@@ -147,7 +721,11 @@ def run_tuning_trial(
     trial_start = perf_counter()
     logger.info("[Tune %d/%d] Starting trial with hparams=%s", trial_idx, total_trials, hparams)
 
-    model = EEGCNN(window_len).to(device)
+    model = EEGCNN(
+        window_len,
+        embedding_dim=int(hparams.get("cnn_embedding_dim", 128)),
+        dropout=float(hparams.get("cnn_dropout", 0.0)),
+    ).to(device)
     criterion = get_loss_function(
         use_huber_loss=hparams.get("use_huber_loss", True),
         huber_beta=float(hparams.get("huber_beta", 1.0)),
