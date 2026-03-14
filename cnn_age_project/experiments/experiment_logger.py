@@ -40,6 +40,7 @@ def get_default_hyperparameters(
     max_windows_per_subject_per_epoch,
     cnn_embedding_dim=128,
     cnn_dropout=0.0,
+    cnn_weight_decay=0.01,
     mil_attention_dim=128,
     mil_attention_dropout=0.1,
     mil_pooling_type="gated",
@@ -49,6 +50,7 @@ def get_default_hyperparameters(
     mil_head_lr=5e-5,
     mil_weight_decay=1e-2,
     mil_regressor_hidden_dim=64,
+    mil_regressor_dropout=0.1,
     mil_allow_replacement_when_small=True,
 ):
     """Return baseline hyperparameters used when no tuned config exists.
@@ -69,6 +71,7 @@ def get_default_hyperparameters(
         "max_windows_per_subject_per_epoch": max_windows_per_subject_per_epoch,
         "cnn_embedding_dim": int(cnn_embedding_dim),
         "cnn_dropout": float(cnn_dropout),
+        "cnn_weight_decay": float(cnn_weight_decay),
         "mil_attention_dim": mil_attention_dim,
         "mil_attention_dropout": mil_attention_dropout,
         "mil_pooling_type": mil_pooling_type,
@@ -78,6 +81,7 @@ def get_default_hyperparameters(
         "mil_head_lr": mil_head_lr,
         "mil_weight_decay": mil_weight_decay,
         "mil_regressor_hidden_dim": mil_regressor_hidden_dim,
+        "mil_regressor_dropout": float(mil_regressor_dropout),
         "mil_allow_replacement_when_small": bool(mil_allow_replacement_when_small),
     }
 
@@ -152,6 +156,7 @@ def build_tuning_candidates(defaults, model_mode="cnn"):
     cnn_max_per_subj = [512, 1024]
     cnn_embedding_dims = [64, 128, 256]
     cnn_dropouts = [0.0, 0.1, 0.2, 0.3, 0.5]
+    cnn_weight_decays = [0.0, 1e-3, 1e-2]
 
     # MIL-focused dimensions.
     mil_attention_dims = [64, 128, 256]
@@ -163,6 +168,7 @@ def build_tuning_candidates(defaults, model_mode="cnn"):
     mil_head_lrs = [1e-4, 1e-3]
     mil_weight_decays = [1e-4, 1e-3, 1e-2]
     mil_regressor_hidden_dims = [64, 128]
+    mil_regressor_dropouts = [0.0, 0.1]
 
     if mode in {"cnn", "both"}:
         for lr in cnn_lrs:
@@ -170,18 +176,20 @@ def build_tuning_candidates(defaults, model_mode="cnn"):
                 for max_per_subj in cnn_max_per_subj:
                     for emb in cnn_embedding_dims:
                         for dp in cnn_dropouts:
-                            base = defaults.copy()
-                            base.update(
-                                {
-                                    "learning_rate": lr,
-                                    "use_huber_loss": True,
-                                    "huber_beta": huber_beta,
-                                    "max_windows_per_subject_per_epoch": max_per_subj,
-                                    "cnn_embedding_dim": int(emb),
-                                    "cnn_dropout": float(dp),
-                                }
-                            )
-                            candidates.append(base)
+                            for wd in cnn_weight_decays:
+                                base = defaults.copy()
+                                base.update(
+                                    {
+                                        "learning_rate": lr,
+                                        "use_huber_loss": True,
+                                        "huber_beta": huber_beta,
+                                        "max_windows_per_subject_per_epoch": max_per_subj,
+                                        "cnn_embedding_dim": int(emb),
+                                        "cnn_dropout": float(dp),
+                                        "cnn_weight_decay": float(wd),
+                                    }
+                                )
+                                candidates.append(base)
 
     if mode in {"mil", "both"}:
         for attention_dim in mil_attention_dims:
@@ -195,21 +203,23 @@ def build_tuning_candidates(defaults, model_mode="cnn"):
                                 for head_lr in mil_head_lrs:
                                     for weight_decay in mil_weight_decays:
                                         for reg_hidden in mil_regressor_hidden_dims:
-                                            base = defaults.copy()
-                                            base.update(
-                                                {
-                                                    "mil_attention_dim": attention_dim,
-                                                    "mil_attention_dropout": attention_dropout,
-                                                    "mil_pooling_type": pooling,
-                                                    "mil_bag_size": bag_size,
-                                                    "mil_sampling_strategy": sampling_strategy,
-                                                    "mil_encoder_lr": enc_lr,
-                                                    "mil_head_lr": head_lr,
-                                                    "mil_weight_decay": weight_decay,
-                                                    "mil_regressor_hidden_dim": reg_hidden,
-                                                }
-                                            )
-                                            candidates.append(base)
+                                            for reg_drop in mil_regressor_dropouts:
+                                                base = defaults.copy()
+                                                base.update(
+                                                    {
+                                                        "mil_attention_dim": attention_dim,
+                                                        "mil_attention_dropout": attention_dropout,
+                                                        "mil_pooling_type": pooling,
+                                                        "mil_bag_size": bag_size,
+                                                        "mil_sampling_strategy": sampling_strategy,
+                                                        "mil_encoder_lr": enc_lr,
+                                                        "mil_head_lr": head_lr,
+                                                        "mil_weight_decay": weight_decay,
+                                                        "mil_regressor_hidden_dim": reg_hidden,
+                                                        "mil_regressor_dropout": float(reg_drop),
+                                                    }
+                                                )
+                                                candidates.append(base)
 
     if defaults not in candidates:
         candidates.append(defaults.copy())
@@ -241,6 +251,7 @@ def build_optuna_candidate(defaults, trial, model_mode="cnn"):
                 ),
                 "cnn_embedding_dim": int(trial.suggest_categorical("cnn_embedding_dim", [64, 128, 256])),
                 "cnn_dropout": float(trial.suggest_categorical("cnn_dropout", [0.0, 0.1, 0.2, 0.3, 0.5])),
+                "cnn_weight_decay": float(trial.suggest_categorical("cnn_weight_decay", [0.0, 1e-3, 1e-2])),
             }
         )
 
@@ -264,6 +275,7 @@ def build_optuna_candidate(defaults, trial, model_mode="cnn"):
                 "mil_head_lr": float(trial.suggest_categorical("mil_head_lr", [1e-4, 1e-3])),
                 "mil_weight_decay": float(trial.suggest_categorical("mil_weight_decay", [1e-4, 1e-3, 1e-2])),
                 "mil_regressor_hidden_dim": int(trial.suggest_categorical("mil_regressor_hidden_dim", [64, 128])),
+                "mil_regressor_dropout": float(trial.suggest_categorical("mil_regressor_dropout", [0.0, 0.1, 0.2])),
             }
         )
 
@@ -315,6 +327,7 @@ def save_run_summary(data_dir, summary_dict, run_tag):
         f"Total Windows: {serializable.get('n_samples', 'n/a')}",
         f"Train Windows: {serializable.get('n_train_windows', 'n/a')}",
         f"Test Windows: {serializable.get('n_test_windows', 'n/a')}",
+        f"Val Windows: {serializable.get('n_val_windows', 0)}",
         f"Train Subjects (CSV): {serializable.get('n_train_subjects_csv', 'n/a')}",
         f"Test Subjects (CSV): {serializable.get('n_test_subjects_csv', 'n/a')}",
         f"Test Subjects (Evaluated): {serializable.get('n_test_subjects_evaluated', 'n/a')}",

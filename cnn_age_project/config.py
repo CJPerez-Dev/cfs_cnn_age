@@ -66,6 +66,41 @@ class Config:
     early_stopping_min_delta_rel: float = 1e-3
     early_stopping_min_delta_abs: float = 1e-4
 
+    # Validation set: if set (e.g. "AgeValidation_Key.csv"), split_code 3 is used for validation
+    validation_key_filename: str | None = None
+
+    # Auto 70/15/15 subject split from metadata (and optional single key file). When True,
+    # AgeTraining_Key.csv and AgeTesting_Key.csv are not required; subjects are split by ratio.
+    use_auto_split: bool = True
+    split_ratio_train: float = 0.70
+    split_ratio_val: float = 0.15
+    split_ratio_test: float = 0.15
+    # Optional single CSV with all subjects + age (SubjectID, VariableValue). If None and
+    # use_auto_split, age is read from metadata if a column "age", "Age", or "VariableValue" exists.
+    subject_key_filename: str | None = None
+
+    # Learning rate scheduler: "none", "plateau" (ReduceLROnPlateau on val loss), or "cosine"
+    lr_scheduler: str = "plateau"
+    reduce_lr_patience: int = 3
+    reduce_lr_factor: float = 0.5
+    min_lr: float = 1e-6
+
+    # Gradient clipping (0 = disabled)
+    grad_clip_norm: float = 1.0
+
+    # CNN optimizer weight decay
+    cnn_weight_decay: float = 1e-2
+
+    # MIL early stopping (fine-tune loop)
+    mil_early_stopping_enabled: bool = True
+    mil_early_stopping_patience: int = 3
+    mil_early_stopping_min_epochs: int = 2
+    mil_early_stopping_min_delta_abs: float = 1e-4
+    mil_early_stopping_min_delta_rel: float = 1e-3
+
+    # MIL bag regressor dropout
+    mil_regressor_dropout: float = 0.1
+
     model_save_name: str = "cnn_age_model.pt"
     report_save_name: str = "cnn_training_report.png"
     subject_report_save_name: str = "cnn_subject_examples.png"
@@ -127,6 +162,13 @@ class Config:
             str: Testing key CSV path.
         """
         return os.path.join(self.input_dir, "AgeTesting_Key.csv")
+
+    @property
+    def validation_key_csv(self):
+        """Optional path to validation-subject age key CSV (None = no validation set)."""
+        if self.validation_key_filename is None:
+            return None
+        return os.path.join(self.input_dir, self.validation_key_filename)
 
 
 CONFIG = Config()
@@ -193,6 +235,30 @@ EARLY_STOPPING_PATIENCE = CONFIG.early_stopping_patience
 EARLY_STOPPING_MIN_EPOCHS = CONFIG.early_stopping_min_epochs
 EARLY_STOPPING_MIN_DELTA_REL = CONFIG.early_stopping_min_delta_rel
 EARLY_STOPPING_MIN_DELTA_ABS = CONFIG.early_stopping_min_delta_abs
+
+VALIDATION_KEY_CSV = CONFIG.validation_key_csv
+USE_AUTO_SPLIT = CONFIG.use_auto_split
+SPLIT_RATIO_TRAIN = CONFIG.split_ratio_train
+SPLIT_RATIO_VAL = CONFIG.split_ratio_val
+SPLIT_RATIO_TEST = CONFIG.split_ratio_test
+SUBJECT_KEY_FILENAME = CONFIG.subject_key_filename
+SUBJECT_KEY_CSV = (
+    os.path.join(CONFIG.input_dir, CONFIG.subject_key_filename)
+    if CONFIG.subject_key_filename
+    else None
+)
+LR_SCHEDULER = CONFIG.lr_scheduler
+REDUCE_LR_PATIENCE = CONFIG.reduce_lr_patience
+REDUCE_LR_FACTOR = CONFIG.reduce_lr_factor
+MIN_LR = CONFIG.min_lr
+GRAD_CLIP_NORM = CONFIG.grad_clip_norm
+CNN_WEIGHT_DECAY = CONFIG.cnn_weight_decay
+MIL_EARLY_STOPPING_ENABLED = CONFIG.mil_early_stopping_enabled
+MIL_EARLY_STOPPING_PATIENCE = CONFIG.mil_early_stopping_patience
+MIL_EARLY_STOPPING_MIN_EPOCHS = CONFIG.mil_early_stopping_min_epochs
+MIL_EARLY_STOPPING_MIN_DELTA_ABS = CONFIG.mil_early_stopping_min_delta_abs
+MIL_EARLY_STOPPING_MIN_DELTA_REL = CONFIG.mil_early_stopping_min_delta_rel
+MIL_REGRESSOR_DROPOUT = CONFIG.mil_regressor_dropout
 
 MODEL_SAVE_NAME = CONFIG.model_save_name
 REPORT_SAVE_NAME = CONFIG.report_save_name

@@ -61,6 +61,8 @@ class DataContext:
         test_indices: Global indices for test windows.
         subject_codes: Subject code per global index.
         subject_codebook: Subject ID lookup by code.
+        val_age_map: Optional validation subject->age mapping (None if no validation set).
+        val_indices: Optional validation window indices (None or empty if no validation set).
     """
     x_mem: np.memmap
     y_mem: np.memmap
@@ -73,6 +75,8 @@ class DataContext:
     test_indices: np.ndarray
     subject_codes: np.memmap
     subject_codebook: list[str]
+    val_age_map: dict[str, float] | None = None
+    val_indices: np.ndarray | None = None
 
 
 @dataclass

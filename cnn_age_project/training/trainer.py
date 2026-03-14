@@ -85,6 +85,7 @@ def build_mil_gated_attention_model(
     regressor_hidden_dim=64,
     pooling_type="gated",
     attention_dropout=0.0,
+    regressor_dropout=0.0,
 ):
     """Construct Step 2 MIL model with gated attention on top of encoder.
 
@@ -99,6 +100,7 @@ def build_mil_gated_attention_model(
         regressor_hidden_dim (int): Bag-level regressor hidden size.
         pooling_type (str): Bag pooling strategy, ``gated`` or ``mean``.
         attention_dropout (float): Dropout within gated attention features.
+        regressor_dropout (float): Dropout in bag regressor after hidden ReLU.
 
     Returns:
         MILAgeRegressor: MIL age regressor with gated attention.
@@ -119,6 +121,7 @@ def build_mil_gated_attention_model(
         regressor_hidden_dim=regressor_hidden_dim,
         pooling_type=pooling_type,
         attention_dropout=attention_dropout,
+        regressor_dropout=regressor_dropout,
     ).to(device)
 
     total_params, trainable_params = summarize_parameter_counts(mil_model)
@@ -308,6 +311,12 @@ def run_mil_finetune_training(
     sampling_strategy,
     debug_chunk_log_every,
     amp_enabled,
+    early_stopping_enabled=True,
+    early_stopping_patience=3,
+    early_stopping_min_epochs=2,
+    early_stopping_min_delta_abs=1e-4,
+    early_stopping_min_delta_rel=1e-3,
+    grad_clip_norm=0.0,
 ):
     """Run Step 3 full-model fine-tuning over stochastic pseudo-bags.
 
@@ -337,6 +346,12 @@ def run_mil_finetune_training(
         sampling_strategy (str): ``random`` or ``sequential`` pseudo-bag sampling.
         debug_chunk_log_every (int): Debug logging cadence.
         amp_enabled (bool): Whether AMP autocast/scaler are enabled.
+        early_stopping_enabled (bool): Enable early stopping.
+        early_stopping_patience (int): Patience epochs.
+        early_stopping_min_epochs (int): Minimum epochs before early stop allowed.
+        early_stopping_min_delta_abs (float): Absolute improvement threshold.
+        early_stopping_min_delta_rel (float): Relative improvement threshold.
+        grad_clip_norm (float): Max gradient norm (0 = disabled).
 
     Returns:
         dict[str, Any]: Fine-tuning history and best-epoch metadata.
@@ -347,6 +362,7 @@ def run_mil_finetune_training(
     best_loss = float("inf")
     best_epoch = 0
     best_state_dict = None
+    epochs_without_improvement = 0
 
     for epoch in range(epochs):
         mil_model.train()
@@ -405,6 +421,9 @@ def run_mil_finetune_training(
                 loss = criterion(outputs, y_model)
 
             scaler.scale(loss).backward()
+            if grad_clip_norm > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(mil_model.parameters(), max_norm=grad_clip_norm)
             scaler.step(optimizer)
             scaler.update()
 
@@ -452,10 +471,32 @@ def run_mil_finetune_training(
             r2,
         )
 
-        if avg_loss < best_loss:
+        improvement_threshold = max(
+            early_stopping_min_delta_abs,
+            abs(best_loss) * early_stopping_min_delta_rel if np.isfinite(best_loss) else 0.0,
+        )
+        improved = (best_loss - avg_loss) > improvement_threshold
+
+        if improved or not np.isfinite(best_loss):
             best_loss = avg_loss
             best_epoch = epoch + 1
+            epochs_without_improvement = 0
             best_state_dict = {key: value.detach().cpu().clone() for key, value in mil_model.state_dict().items()}
+        else:
+            epochs_without_improvement += 1
+
+        if (
+            early_stopping_enabled
+            and (epoch + 1) >= early_stopping_min_epochs
+            and epochs_without_improvement >= early_stopping_patience
+        ):
+            logger.info(
+                "MIL early stopping at epoch %d (best epoch: %d, best loss: %.4f).",
+                epoch + 1,
+                best_epoch,
+                best_loss,
+            )
+            break
 
     if best_state_dict is not None:
         mil_model.load_state_dict(best_state_dict)
@@ -600,6 +641,7 @@ def setup_model_and_optimizers(
     learning_rate,
     cnn_embedding_dim: int = 128,
     cnn_dropout: float = 0.0,
+    cnn_weight_decay: float = 0.0,
 ):
     """Build model/loss/optimizer/scaler and optionally apply torch.compile.
 
@@ -612,6 +654,7 @@ def setup_model_and_optimizers(
         use_huber_loss (bool): If True, use Huber loss.
         huber_beta (float): Beta parameter for Huber loss.
         learning_rate (float): Optimizer learning rate.
+        cnn_weight_decay (float): Weight decay for AdamW (0 = disabled).
 
     Returns:
         tuple: ``(model, criterion, optimizer, scaler, amp_enabled, triton_available, compile_applied)``.
@@ -648,7 +691,12 @@ def setup_model_and_optimizers(
             logger.warning("`torch.compile` skipped: Triton not available.")
 
     criterion = get_loss_function(use_huber_loss=use_huber_loss, huber_beta=huber_beta)
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, fused=(device.type == "cuda"))
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=learning_rate,
+        weight_decay=float(cnn_weight_decay),
+        fused=(device.type == "cuda"),
+    )
     amp_enabled = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
@@ -683,6 +731,8 @@ def run_tuning_trial(
     max_windows_per_subject_per_epoch,
     debug_chunk_log_every,
     plot_max_points,
+    grad_clip_norm=0.0,
+    val_indices=None,
 ):
     """Train a short trial with candidate hyperparameters and return held-out metrics.
 
@@ -734,6 +784,7 @@ def run_tuning_trial(
     optimizer = optim.AdamW(
         model.parameters(),
         lr=float(hparams.get("learning_rate", 3e-4)),
+        weight_decay=float(hparams.get("cnn_weight_decay", 0.0)),
         fused=(device.type == "cuda"),
     )
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
@@ -796,6 +847,9 @@ def run_tuning_trial(
                 loss = criterion(outputs, y_batch_model)
 
             scaler.scale(loss).backward()
+            if grad_clip_norm > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
             scaler.step(optimizer)
             scaler.update()
 
@@ -835,23 +889,62 @@ def run_tuning_trial(
         plot_max_points=plot_max_points,
         debug_chunk_log_every=debug_chunk_log_every,
     )
-    trial_seconds = perf_counter() - trial_start
-    logger.info(
-        "[Tune %d/%d] Completed in %.1fs | test_mae=%.3f test_r2=%.4f",
-        trial_idx,
-        total_trials,
-        trial_seconds,
-        test_mae,
-        test_r2,
-    )
 
-    return {
+    selection_mae = float(test_mae)
+    val_mae = None
+    val_r2 = None
+    if val_indices is not None and val_indices.size > 0:
+        val_loss, val_r2, val_mae, _, _, _, _, _ = run_epoch_metrics(
+            model=model,
+            x_mem=x_mem,
+            y_mem=y_mem,
+            indices=val_indices,
+            batch_size=batch_size,
+            device=device,
+            criterion=criterion,
+            amp_enabled=amp_enabled,
+            subject_codes=None,
+            n_subjects=0,
+            x_mean=x_mean,
+            x_std=x_std,
+            y_mean=y_mean,
+            y_std=y_std,
+            normalize_target=normalize_target,
+            plot_max_points=0,
+            debug_chunk_log_every=debug_chunk_log_every,
+        )
+        selection_mae = float(val_mae)
+        logger.info(
+            "[Tune %d/%d] Completed | val_mae=%.3f (selection) | test_mae=%.3f test_r2=%.4f",
+            trial_idx,
+            total_trials,
+            selection_mae,
+            test_mae,
+            test_r2,
+        )
+    else:
+        logger.info(
+            "[Tune %d/%d] Completed in %.1fs | test_mae=%.3f test_r2=%.4f",
+            trial_idx,
+            total_trials,
+            perf_counter() - trial_start,
+            test_mae,
+            test_r2,
+        )
+
+    trial_seconds = perf_counter() - trial_start
+    out = {
         "hparams": hparams,
         "test_loss": float(test_loss),
         "test_r2": float(test_r2) if np.isfinite(test_r2) else np.nan,
         "test_mae": float(test_mae),
+        "selection_mae": selection_mae,
         "trial_seconds": float(trial_seconds),
     }
+    if val_mae is not None:
+        out["val_mae"] = float(val_mae)
+        out["val_r2"] = float(val_r2) if np.isfinite(val_r2) else np.nan
+    return out
 
 
 def train_model(
@@ -885,8 +978,14 @@ def train_model(
     early_stopping_min_delta_abs,
     early_stopping_min_delta_rel,
     amp_enabled,
+    val_indices=None,
+    lr_scheduler_type="none",
+    reduce_lr_patience=3,
+    reduce_lr_factor=0.5,
+    min_lr=1e-6,
+    grad_clip_norm=0.0,
 ):
-    """Run full training loop with optional balanced sampling and early stopping.
+    """Run full training loop with optional balanced sampling, validation, LR scheduler, and early stopping.
 
     Args:
         model (torch.nn.Module): Model to train.
@@ -932,6 +1031,18 @@ def train_model(
     best_state_dict = None
     final_targets_plot = []
     final_preds_plot = []
+
+    scheduler = None
+    if lr_scheduler_type == "plateau":
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=reduce_lr_factor, patience=reduce_lr_patience, min_lr=min_lr
+        )
+        logger.info("LR scheduler: ReduceLROnPlateau (patience=%d, factor=%.2f)", reduce_lr_patience, reduce_lr_factor)
+    elif lr_scheduler_type == "cosine":
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=min_lr)
+        logger.info("LR scheduler: CosineAnnealingLR (eta_min=%.0e)", min_lr)
+
+    use_val_for_monitor = val_indices is not None and val_indices.size > 0
 
     for epoch in range(epochs):
         model.train()
@@ -986,6 +1097,9 @@ def train_model(
                 loss = criterion(outputs, y_batch_model)
 
             scaler.scale(loss).backward()
+            if grad_clip_norm > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
             scaler.step(optimizer)
             scaler.update()
 
@@ -1043,25 +1157,65 @@ def train_model(
         r2_scores.append(r2)
         maes.append(mae)
 
-        logger.info("Epoch %d | Loss: %.4f | R2: %.4f | MAE: %.2f", epoch + 1, avg_loss, r2, mae)
+        val_loss = None
+        if use_val_for_monitor:
+            val_result = run_epoch_metrics(
+                model,
+                x_mem,
+                y_mem,
+                val_indices,
+                batch_size,
+                device,
+                criterion,
+                amp_enabled,
+                subject_codes=None,
+                n_subjects=0,
+                x_mean=x_mean,
+                x_std=x_std,
+                y_mean=y_mean,
+                y_std=y_std,
+                normalize_target=normalize_target,
+                plot_max_points=0,
+                debug_chunk_log_every=debug_chunk_log_every,
+            )
+            val_loss = val_result[0]
+            val_mae = val_result[2]
+            logger.info(
+                "Epoch %d | Train Loss: %.4f | Val Loss: %.4f | Val MAE: %.2f | R2: %.4f | MAE: %.2f",
+                epoch + 1,
+                avg_loss,
+                val_loss,
+                val_mae,
+                r2,
+                mae,
+            )
+        else:
+            logger.info("Epoch %d | Loss: %.4f | R2: %.4f | MAE: %.2f", epoch + 1, avg_loss, r2, mae)
 
         if len(epoch_targets_plot) > 0 and len(epoch_preds_plot) > 0:
             final_targets_plot = epoch_targets_plot
             final_preds_plot = epoch_preds_plot
 
+        monitor_loss = val_loss if (use_val_for_monitor and val_loss is not None) else avg_loss
         improvement_threshold = max(
             early_stopping_min_delta_abs,
             abs(best_loss) * early_stopping_min_delta_rel if np.isfinite(best_loss) else 0.0,
         )
-        improved = (best_loss - avg_loss) > improvement_threshold
+        improved = (best_loss - monitor_loss) > improvement_threshold
 
         if improved or not np.isfinite(best_loss):
-            best_loss = avg_loss
+            best_loss = monitor_loss
             best_epoch = epoch + 1
             epochs_without_improvement = 0
             best_state_dict = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
         else:
             epochs_without_improvement += 1
+
+        if scheduler is not None:
+            if lr_scheduler_type == "plateau":
+                scheduler.step(monitor_loss)
+            else:
+                scheduler.step()
 
         if (
             early_stopping_enabled

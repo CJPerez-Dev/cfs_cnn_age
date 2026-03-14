@@ -44,9 +44,11 @@ class EEGCNN(nn.Module):
             nn.AdaptiveAvgPool1d(1),
         )
 
+        reg_drop = nn.Dropout(dp) if dp > 0.0 else nn.Identity()
         self.regressor = nn.Sequential(
             nn.Linear(int(embedding_dim), 64),
             nn.ReLU(),
+            reg_drop,
             nn.Linear(64, 1),
         )
 

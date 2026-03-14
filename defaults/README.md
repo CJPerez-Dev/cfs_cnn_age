@@ -48,11 +48,9 @@ How the pipeline uses these files
 
 Tuning behavior
 
-- `--model-mode cnn --tune`: tunes CNN-focused parameters.
-- `--model-mode mil --tune`: tunes MIL-focused parameters (attention, pooling,
-  bag size/sampling, and MIL optimizer rates).
-- `--model-mode both --tune`: runs paired CNN and MIL trial evaluations and
-  chooses the best configuration by mean test MAE across both branches.
+- `--model-mode cnn --tune`: tunes CNN-focused parameters (LR, dropout, weight decay, embedding dim, etc.).
+- `--model-mode mil --tune`: tunes MIL-focused parameters (attention, pooling, bag size/sampling, and MIL optimizer rates).
+- `--model-mode both --tune`: runs paired CNN and MIL trial evaluations. Best configuration is chosen by **validation MAE** when a validation set exists (e.g. with auto-split), otherwise by test MAE.
 
 If you prefer not to use repository defaults, always pass `--mil-pretrained-model`
 and/or `--hparams-file` on the command line.

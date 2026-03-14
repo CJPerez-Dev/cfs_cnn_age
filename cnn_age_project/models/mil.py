@@ -204,6 +204,7 @@ class MILAgeRegressor(nn.Module):
         regressor_hidden_dim: int = 64,
         pooling_type: str = "gated",
         attention_dropout: float = 0.0,
+        regressor_dropout: float = 0.0,
     ):
         """Initialize MIL regressor modules.
 
@@ -212,6 +213,7 @@ class MILAgeRegressor(nn.Module):
             feature_dim (int): Encoder output dimension.
             attention_dim (int): Hidden size inside gated attention.
             regressor_hidden_dim (int): Hidden size of bag-level regressor.
+            regressor_dropout (float): Dropout probability in bag regressor after hidden ReLU.
 
         Returns:
             None
@@ -228,22 +230,26 @@ class MILAgeRegressor(nn.Module):
             attention_dim=attention_dim,
             dropout=float(attention_dropout),
         )
+        rd = float(regressor_dropout)
+        reg_drop = nn.Dropout(rd) if rd > 0.0 else nn.Identity()
         self.bag_regressor = nn.Sequential(
             nn.Linear(feature_dim, regressor_hidden_dim),
             nn.ReLU(),
+            reg_drop,
             nn.Linear(regressor_hidden_dim, 1),
         )
 
         enc_total, enc_trainable = summarize_parameter_counts(self.instance_encoder)
         logger.info(
             "MILAgeRegressor initialized | feature_dim=%d attention_dim=%d "
-            "regressor_hidden_dim=%d pooling_type=%s attention_dropout=%.3f "
+            "regressor_hidden_dim=%d pooling_type=%s attention_dropout=%.3f regressor_dropout=%.3f "
             "encoder_total_params=%d encoder_trainable_params=%d",
             feature_dim,
             attention_dim,
             regressor_hidden_dim,
             self.pooling_type,
             float(attention_dropout),
+            float(regressor_dropout),
             enc_total,
             enc_trainable,
         )

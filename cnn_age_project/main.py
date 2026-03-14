@@ -73,6 +73,24 @@ def parse_args():
         default="cnn",
         help="Select execution mode: baseline CNN only, MIL only, or both back-to-back with comparison artifacts.",
     )
+    parser.add_argument(
+        "--validation-key",
+        type=str,
+        default=None,
+        help="Optional validation subject key CSV filename (e.g. AgeValidation_Key.csv) in input/. When set, a validation set is used for early stopping and LR scheduling.",
+    )
+    parser.add_argument(
+        "--auto-split",
+        action="store_true",
+        default=True,
+        help="Use 70/15/15 subject-level train/val/test split from AgeKey.csv or metadata (default).",
+    )
+    parser.add_argument(
+        "--no-auto-split",
+        action="store_false",
+        dest="auto_split",
+        help="Use AgeTraining_Key.csv and AgeTesting_Key.csv for train/test split instead of auto-split.",
+    )
 
     parser.add_argument("--mil-finetune", action="store_true", help="Enable MIL Step 3 fine-tuning mode (unfreeze encoder + train full MIL model).")
     parser.add_argument("--mil-pretrained-model", type=str, default=None, help="Optional path to pretrained CNN checkpoint used to initialize MIL encoder.")
@@ -80,6 +98,7 @@ def parse_args():
     parser.add_argument("--mil-attention-dropout", type=float, default=None, help="Dropout within MIL attention head.")
     parser.add_argument("--mil-pooling-type", type=str, choices=["gated", "mean"], default=None, help="MIL bag pooling type.")
     parser.add_argument("--mil-regressor-hidden-dim", type=int, default=None, help="Hidden size for MIL bag-level regressor.")
+    parser.add_argument("--mil-regressor-dropout", type=float, default=None, help="Dropout in MIL bag regressor after hidden ReLU.")
     parser.add_argument("--mil-bag-batch-size", type=int, default=None, help="Number of pseudo-bags per optimizer step in MIL fine-tuning.")
     parser.add_argument(
         "--mil-pseudo-bag-min-windows",

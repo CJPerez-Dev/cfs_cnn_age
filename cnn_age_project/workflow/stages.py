@@ -59,14 +59,34 @@ from cnn_age_project.config import (
     USE_HUBER_LOSS,
     USE_TF32,
     USE_TORCH_COMPILE,
+    USE_AUTO_SPLIT,
+    VALIDATION_KEY_CSV,
+    SPLIT_RATIO_TRAIN,
+    SPLIT_RATIO_VAL,
+    SPLIT_RATIO_TEST,
+    SUBJECT_KEY_CSV,
+    LR_SCHEDULER,
+    REDUCE_LR_PATIENCE,
+    REDUCE_LR_FACTOR,
+    MIN_LR,
+    GRAD_CLIP_NORM,
+    CNN_WEIGHT_DECAY,
+    MIL_EARLY_STOPPING_ENABLED,
+    MIL_EARLY_STOPPING_PATIENCE,
+    MIL_EARLY_STOPPING_MIN_EPOCHS,
+    MIL_EARLY_STOPPING_MIN_DELTA_ABS,
+    MIL_EARLY_STOPPING_MIN_DELTA_REL,
+    MIL_REGRESSOR_DROPOUT,
     PROJECT_DIR,
     DEFAULT_MODEL_PATH,
     DEFAULT_HPARAMS_PATH,
 )
 from cnn_age_project.data.data_io import (
     build_or_load_targets_and_split,
+    build_subject_age_map_from_metadata,
     load_memmap_arrays,
     load_subject_age_map,
+    split_subjects_ratio,
     validate_subject_wise_split_integrity,
     validate_required_project_files,
 )
@@ -160,6 +180,8 @@ def _run_candidate_trial(
             max_windows_per_subject_per_epoch=MAX_WINDOWS_PER_SUBJECT_PER_EPOCH,
             debug_chunk_log_every=DEBUG_CHUNK_LOG_EVERY,
             plot_max_points=PLOT_MAX_POINTS,
+            grad_clip_norm=GRAD_CLIP_NORM,
+            val_indices=data_ctx.val_indices,
         )
 
     if mode_for_tune == "mil":
@@ -204,6 +226,8 @@ def _run_candidate_trial(
             max_windows_per_subject_per_epoch=MAX_WINDOWS_PER_SUBJECT_PER_EPOCH,
             debug_chunk_log_every=DEBUG_CHUNK_LOG_EVERY,
             plot_max_points=PLOT_MAX_POINTS,
+            grad_clip_norm=GRAD_CLIP_NORM,
+            val_indices=data_ctx.val_indices,
         )
         mil_result = _run_mil_tuning_trial(
             trial_idx=trial_idx,
@@ -275,26 +299,38 @@ def initialize_run_context():
     )
 
 
-def setup_runtime_context():
+def setup_runtime_context(args=None):
     """Validate filesystem prerequisites and initialize device/runtime paths.
 
     Args:
-        None
+        args (argparse.Namespace | None): Optional CLI args; --auto-split overrides config.
 
     Returns:
         RuntimeContext: Runtime device information and cache paths.
     """
+    use_auto_split = getattr(args, "auto_split", USE_AUTO_SPLIT) if args is not None else USE_AUTO_SPLIT
+
     log_stage("Preflight Checks", logger)
-    memmap_root = validate_required_project_files(INPUT_DIR, OUTPUT_DIR)
+    memmap_root = validate_required_project_files(INPUT_DIR, OUTPUT_DIR, use_auto_split=use_auto_split)
     logging.info("Memmap source directory: %s", memmap_root)
 
     log_stage("Device Setup", logger)
     device, gpu_name = select_device(USE_TF32, logger)
 
-    split_cache_path = os.path.join(OUTPUT_DIR, SPLIT_CACHE_FILE)
-    age_cache_path = os.path.join(OUTPUT_DIR, AGE_TARGET_CACHE_FILE)
-    subject_code_cache_path = os.path.join(OUTPUT_DIR, SUBJECT_CODE_CACHE_FILE)
-    subject_codebook_path = os.path.join(OUTPUT_DIR, SUBJECT_CODEBOOK_FILE)
+    if use_auto_split:
+        base_s, ext_s = os.path.splitext(SPLIT_CACHE_FILE)
+        base_a, ext_a = os.path.splitext(AGE_TARGET_CACHE_FILE)
+        base_c, ext_c = os.path.splitext(SUBJECT_CODE_CACHE_FILE)
+        base_cb, ext_cb = os.path.splitext(SUBJECT_CODEBOOK_FILE)
+        split_cache_path = os.path.join(OUTPUT_DIR, base_s + "_auto" + ext_s)
+        age_cache_path = os.path.join(OUTPUT_DIR, base_a + "_auto" + ext_a)
+        subject_code_cache_path = os.path.join(OUTPUT_DIR, base_c + "_auto" + ext_c)
+        subject_codebook_path = os.path.join(OUTPUT_DIR, base_cb + "_auto" + ext_cb)
+    else:
+        split_cache_path = os.path.join(OUTPUT_DIR, SPLIT_CACHE_FILE)
+        age_cache_path = os.path.join(OUTPUT_DIR, AGE_TARGET_CACHE_FILE)
+        subject_code_cache_path = os.path.join(OUTPUT_DIR, SUBJECT_CODE_CACHE_FILE)
+        subject_codebook_path = os.path.join(OUTPUT_DIR, SUBJECT_CODEBOOK_FILE)
 
     return RuntimeContext(
         memmap_root=memmap_root,
@@ -307,11 +343,12 @@ def setup_runtime_context():
     )
 
 
-def load_data_context(runtime_ctx: RuntimeContext):
+def load_data_context(runtime_ctx: RuntimeContext, args=None):
     """Load memmaps, build/load split caches, and return train/test indices.
 
     Args:
         runtime_ctx (RuntimeContext): Runtime context with memmap root and cache paths.
+        args (argparse.Namespace | None): Optional CLI args; --validation-key overrides config.
 
     Returns:
         DataContext: Loaded arrays, split indices, and subject metadata.
@@ -328,15 +365,72 @@ def load_data_context(runtime_ctx: RuntimeContext):
     logging.info("Detected window length: %d", window_len)
     logging.info("Memmap tensors ready (contiguous streaming batches).")
 
-    if not os.path.exists(TRAIN_KEY_CSV) or not os.path.exists(TEST_KEY_CSV):
-        raise FileNotFoundError("Training/testing key CSV files were not found in input folder.")
-
     log_stage("Label + Split Preparation", logger)
-    train_age_map = load_subject_age_map(TRAIN_KEY_CSV)
-    test_age_map = load_subject_age_map(TEST_KEY_CSV)
-    overlap_subjects = set(train_age_map).intersection(set(test_age_map))
-    if len(overlap_subjects) > 0:
-        raise ValueError(f"Train/test subject overlap detected: {len(overlap_subjects)} subjects.")
+    use_auto_split = getattr(args, "auto_split", USE_AUTO_SPLIT) if args is not None else USE_AUTO_SPLIT
+
+    if use_auto_split:
+        # 70/15/15 (or configured ratios) subject split from metadata; key files ignored.
+        subject_age = None
+        key_path = SUBJECT_KEY_CSV
+        if key_path is None or not os.path.exists(key_path):
+            key_path = os.path.join(INPUT_DIR, "AgeKey.csv")
+        if key_path and os.path.exists(key_path):
+            subject_age = load_subject_age_map(key_path)
+            logger.info("Auto-split: loaded subject ages from %s | %d subjects", key_path, len(subject_age))
+        if not subject_age:
+            subject_age = build_subject_age_map_from_metadata(meta_path, n_samples)
+            if subject_age:
+                logger.info("Auto-split: using age column from metadata | %d subjects", len(subject_age))
+        if not subject_age:
+            raise ValueError(
+                "use_auto_split is True but no subject ages found. "
+                "Provide a single key CSV (config.subject_key_filename) with SubjectID, VariableValue, "
+                "or add an age column (age, Age, or VariableValue) to the metadata CSV."
+            )
+        subject_ids = list(subject_age.keys())
+        rng_split = np.random.default_rng(RANDOM_SEED)
+        train_ids, val_ids, test_ids = split_subjects_ratio(
+            subject_ids,
+            SPLIT_RATIO_TRAIN,
+            SPLIT_RATIO_VAL,
+            SPLIT_RATIO_TEST,
+            rng_split,
+        )
+        train_age_map = {s: subject_age[s] for s in train_ids}
+        test_age_map = {s: subject_age[s] for s in test_ids}
+        val_age_map = {s: subject_age[s] for s in val_ids}
+        logger.info(
+            "Auto-split (subject-level) | train: %d val: %d test: %d subjects (ratios %.2f/%.2f/%.2f)",
+            len(train_age_map),
+            len(val_age_map),
+            len(test_age_map),
+            SPLIT_RATIO_TRAIN,
+            SPLIT_RATIO_VAL,
+            SPLIT_RATIO_TEST,
+        )
+    else:
+        if not os.path.exists(TRAIN_KEY_CSV) or not os.path.exists(TEST_KEY_CSV):
+            raise FileNotFoundError("Training/testing key CSV files were not found in input folder.")
+        train_age_map = load_subject_age_map(TRAIN_KEY_CSV)
+        test_age_map = load_subject_age_map(TEST_KEY_CSV)
+        overlap_subjects = set(train_age_map).intersection(set(test_age_map))
+        if len(overlap_subjects) > 0:
+            raise ValueError(f"Train/test subject overlap detected: {len(overlap_subjects)} subjects.")
+        val_age_map = None
+        validation_csv_path = None
+        if getattr(args, "validation_key", None):
+            validation_csv_path = os.path.join(INPUT_DIR, args.validation_key)
+        elif VALIDATION_KEY_CSV is not None:
+            validation_csv_path = VALIDATION_KEY_CSV
+        if validation_csv_path is not None and os.path.exists(validation_csv_path):
+            val_age_map = load_subject_age_map(validation_csv_path)
+            for name, other in [("train", train_age_map), ("test", test_age_map)]:
+                overlap = set(val_age_map).intersection(set(other))
+                if overlap:
+                    raise ValueError(
+                        f"Validation subjects must not overlap with {name}: {len(overlap)} overlapping."
+                    )
+            logger.info("Validation set loaded from %s | %d subjects", validation_csv_path, len(val_age_map))
 
     split_codes, age_targets, subject_codes, subject_codebook = build_or_load_targets_and_split(
         meta_path=meta_path,
@@ -347,11 +441,17 @@ def load_data_context(runtime_ctx: RuntimeContext):
         age_cache_path=runtime_ctx.age_cache_path,
         subject_code_cache_path=runtime_ctx.subject_code_cache_path,
         subject_codebook_path=runtime_ctx.subject_codebook_path,
+        val_age_map=val_age_map,
     )
 
     valid_age = np.isfinite(age_targets)
     train_indices = np.where((split_codes == 1) & valid_age)[0]
     test_indices = np.where((split_codes == 2) & valid_age)[0]
+    val_indices = np.where((split_codes == 3) & valid_age)[0]
+    if val_indices.size == 0:
+        val_indices = None
+    else:
+        val_indices = np.sort(val_indices)
 
     if train_indices.size == 0 or test_indices.size == 0:
         raise ValueError("No train/test windows with valid age labels found.")
@@ -365,9 +465,13 @@ def load_data_context(runtime_ctx: RuntimeContext):
         test_indices=test_indices,
         subject_codes=subject_codes,
         subject_codebook=subject_codebook,
+        val_indices=val_indices,
     )
 
-    logging.info("Split windows with age labels | train: %d | test: %d", train_indices.size, test_indices.size)
+    log_msg = "Split windows with age labels | train: %d | test: %d" % (train_indices.size, test_indices.size)
+    if val_indices is not None:
+        log_msg += " | val: %d" % val_indices.size
+    logging.info(log_msg)
     logger.info("Unique subjects discovered in metadata: %d", len(subject_codebook))
 
     return DataContext(
@@ -382,6 +486,8 @@ def load_data_context(runtime_ctx: RuntimeContext):
         test_indices=test_indices,
         subject_codes=subject_codes,
         subject_codebook=subject_codebook,
+        val_age_map=val_age_map,
+        val_indices=val_indices,
     )
 
 
@@ -492,6 +598,7 @@ def _run_mil_tuning_trial(
         regressor_hidden_dim=int(hparams.get("mil_regressor_hidden_dim", 64)),
         pooling_type=str(hparams.get("mil_pooling_type", "gated")),
         attention_dropout=float(hparams.get("mil_attention_dropout", 0.0)),
+        regressor_dropout=float(hparams.get("mil_regressor_dropout", 0.1)),
     )
 
     criterion = get_loss_function(
@@ -606,6 +713,7 @@ def select_hyperparameters(args, data_ctx: DataContext, norm_ctx: NormalizationC
         use_huber_loss=USE_HUBER_LOSS,
         huber_beta=HUBER_BETA,
         max_windows_per_subject_per_epoch=MAX_WINDOWS_PER_SUBJECT_PER_EPOCH,
+        cnn_weight_decay=float(getattr(args, "cnn_weight_decay", CNN_WEIGHT_DECAY) or CNN_WEIGHT_DECAY),
         mil_attention_dim=int(getattr(args, "mil_attention_dim", 128) or 128),
         mil_attention_dropout=float(getattr(args, "mil_attention_dropout", 0.1) or 0.1),
         mil_pooling_type=str(getattr(args, "mil_pooling_type", "gated") or "gated"),
@@ -615,6 +723,7 @@ def select_hyperparameters(args, data_ctx: DataContext, norm_ctx: NormalizationC
         mil_head_lr=float(getattr(args, "mil_head_lr", MIL_FINETUNE_HEAD_LR) or MIL_FINETUNE_HEAD_LR),
         mil_weight_decay=float(getattr(args, "mil_weight_decay", MIL_FINETUNE_WEIGHT_DECAY) or MIL_FINETUNE_WEIGHT_DECAY),
         mil_regressor_hidden_dim=int(getattr(args, "mil_regressor_hidden_dim", 64) or 64),
+        mil_regressor_dropout=float(getattr(args, "mil_regressor_dropout", MIL_REGRESSOR_DROPOUT) or MIL_REGRESSOR_DROPOUT),
         mil_allow_replacement_when_small=bool(
             getattr(args, "mil_allow_replacement_when_small", MIL_ALLOW_REPLACEMENT_WHEN_SMALL)
             if getattr(args, "mil_allow_replacement_when_small", None) is not None
@@ -706,8 +815,9 @@ def select_hyperparameters(args, data_ctx: DataContext, norm_ctx: NormalizationC
                 trial_result["trial_number"] = int(trial.number)
                 trial_result["search_backend"] = "optuna"
                 tuning_results.append(trial_result)
-                trial.set_user_attr("test_mae", float(trial_result["test_mae"]))
-                return float(trial_result["test_mae"])
+                selection_mae = trial_result.get("selection_mae", trial_result["test_mae"])
+                trial.set_user_attr("selection_mae", float(selection_mae))
+                return float(selection_mae)
 
             study.optimize(_objective, n_trials=max_trials, show_progress_bar=False)
             logger.info(
@@ -747,19 +857,23 @@ def select_hyperparameters(args, data_ctx: DataContext, norm_ctx: NormalizationC
                 trial_result["search_backend"] = "grid"
                 tuning_results.append(trial_result)
 
-                if best_so_far is None or trial_result["test_mae"] < best_so_far["test_mae"]:
+                selection_mae = trial_result.get("selection_mae", trial_result["test_mae"])
+                if best_so_far is None or selection_mae < best_so_far.get("selection_mae", best_so_far["test_mae"]):
                     best_so_far = trial_result
                     logger.info(
                         "[Tune] New best at trial %d | MAE=%.3f R2=%.4f hparams=%s",
                         trial_idx,
-                        trial_result["test_mae"],
+                        selection_mae,
                         trial_result["test_r2"],
                         trial_result["hparams"],
                     )
 
-                trial_bar.set_postfix(best_mae=f"{best_so_far['test_mae']:.3f}" if best_so_far else "n/a")
+                best_sel = best_so_far.get("selection_mae", best_so_far["test_mae"]) if best_so_far else None
+                trial_bar.set_postfix(best_mae=f"{best_sel:.3f}" if best_sel is not None else "n/a")
 
-        best_trial = min(tuning_results, key=lambda item: item["test_mae"])
+        def _selection_mae(item):
+            return item.get("selection_mae", item["test_mae"])
+        best_trial = min(tuning_results, key=_selection_mae)
         active_hparams = best_trial["hparams"]
         # If the user provided a tune name, incorporate it into the saved filename.
         hparams_dir = os.path.join(OUTPUT_DIR, "hparams")
@@ -773,7 +887,8 @@ def select_hyperparameters(args, data_ctx: DataContext, norm_ctx: NormalizationC
             dest_path = os.path.join(hparams_dir, f"best_hyperparameters_{tag}.json")
         save_best_hyperparameters(dest_path, active_hparams, tuning_results=tuning_results)
         logger.info(
-            "Best tuning hyperparameters selected | MAE=%.3f R2=%.4f hparams=%s | total_tune_time=%.1fs",
+            "Best tuning hyperparameters selected | selection_mae=%.3f test_mae=%.3f R2=%.4f hparams=%s | total_tune_time=%.1fs",
+            _selection_mae(best_trial),
             best_trial["test_mae"],
             best_trial["test_r2"],
             active_hparams,
@@ -859,6 +974,9 @@ def run_training_stage(
         mil_attention_dropout = float(
             _resolve_cli_or_hparam(args, "mil_attention_dropout", active_hparams, "mil_attention_dropout", 0.0)
         )
+        mil_regressor_dropout = float(
+            _resolve_cli_or_hparam(args, "mil_regressor_dropout", active_hparams, "mil_regressor_dropout", MIL_REGRESSOR_DROPOUT)
+        )
         mil_encoder_lr = float(
             _resolve_cli_or_hparam(args, "mil_encoder_lr", active_hparams, "mil_encoder_lr", MIL_FINETUNE_ENCODER_LR)
         )
@@ -911,6 +1029,7 @@ def run_training_stage(
             regressor_hidden_dim=mil_regressor_hidden_dim,
             pooling_type=mil_pooling_type,
             attention_dropout=mil_attention_dropout,
+            regressor_dropout=mil_regressor_dropout,
         )
 
         mil_sorted_indices = norm_ctx.balanced_sorted_indices
@@ -965,6 +1084,12 @@ def run_training_stage(
             sampling_strategy=mil_sampling_strategy,
             debug_chunk_log_every=DEBUG_CHUNK_LOG_EVERY,
             amp_enabled=amp_enabled,
+            early_stopping_enabled=MIL_EARLY_STOPPING_ENABLED,
+            early_stopping_patience=MIL_EARLY_STOPPING_PATIENCE,
+            early_stopping_min_epochs=MIL_EARLY_STOPPING_MIN_EPOCHS,
+            early_stopping_min_delta_abs=MIL_EARLY_STOPPING_MIN_DELTA_ABS,
+            early_stopping_min_delta_rel=MIL_EARLY_STOPPING_MIN_DELTA_REL,
+            grad_clip_norm=GRAD_CLIP_NORM,
         )
 
         return TrainingContext(
@@ -994,6 +1119,7 @@ def run_training_stage(
         learning_rate=hparam_ctx.active_lr,
         cnn_embedding_dim=int(hparam_ctx.active_hparams.get("cnn_embedding_dim", 128)),
         cnn_dropout=float(hparam_ctx.active_hparams.get("cnn_dropout", 0.0)),
+        cnn_weight_decay=float(hparam_ctx.active_hparams.get("cnn_weight_decay", CNN_WEIGHT_DECAY)),
     )
 
     log_stage("Model Training", logger)
@@ -1030,6 +1156,12 @@ def run_training_stage(
         early_stopping_min_delta_abs=EARLY_STOPPING_MIN_DELTA_ABS,
         early_stopping_min_delta_rel=EARLY_STOPPING_MIN_DELTA_REL,
         amp_enabled=amp_enabled,
+        val_indices=data_ctx.val_indices,
+        lr_scheduler_type=LR_SCHEDULER,
+        reduce_lr_patience=REDUCE_LR_PATIENCE,
+        reduce_lr_factor=REDUCE_LR_FACTOR,
+        min_lr=MIN_LR,
+        grad_clip_norm=GRAD_CLIP_NORM,
     )
 
     return TrainingContext(
@@ -1301,6 +1433,7 @@ def save_artifacts_and_summary(
         "n_samples": int(data_ctx.n_samples),
         "n_train_windows": int(data_ctx.train_indices.size),
         "n_test_windows": int(data_ctx.test_indices.size),
+        "n_val_windows": int(data_ctx.val_indices.size) if data_ctx.val_indices is not None else 0,
         "n_train_subjects_csv": int(len(data_ctx.train_age_map)),
         "n_test_subjects_csv": int(len(data_ctx.test_age_map)),
         "n_test_subjects_evaluated": int(len(eval_ctx.subj_ids)),
@@ -1384,8 +1517,8 @@ def execute_full_workflow(args):
         None
     """
     run_ctx = initialize_run_context()
-    runtime_ctx = setup_runtime_context()
-    data_ctx = load_data_context(runtime_ctx)
+    runtime_ctx = setup_runtime_context(args)
+    data_ctx = load_data_context(runtime_ctx, args)
     norm_ctx = setup_normalization_context(data_ctx, run_ctx.rng)
     model_labels = _resolve_model_modes(args)
 
