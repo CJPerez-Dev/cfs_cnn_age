@@ -8,11 +8,14 @@ import numpy as np
 import torch
 import torch.optim as optim
 
+from cnn_age_project.data.age_strata import build_mil_train_subject_inverse_frequency_probs
 from cnn_age_project.data.dataset import (
     iter_subject_pseudo_bag_batches,
     iter_memmap_batches,
     sample_balanced_train_indices,
     sample_epoch_subject_pseudo_bags,
+    sample_subject_pseudo_bag_indices,
+    sample_weighted_train_epoch_indices,
 )
 from cnn_age_project.evaluation.evaluation import run_epoch_metrics
 from cnn_age_project.utils.age_predictions import clip_predicted_ages_in_years
@@ -20,6 +23,13 @@ from cnn_age_project.models.cnn_model import EEGCNN
 from cnn_age_project.models.mil import MILAgeRegressor, MILInstanceEncoder, summarize_parameter_counts
 from cnn_age_project.training.losses import get_loss_function
 from cnn_age_project.utils.utils import make_tqdm
+from cnn_age_project.config import (
+    MIL_INVERSE_FREQUENCY_SUBJECT_SAMPLING,
+    MIL_SUBJECT_DRAWS_PER_EPOCH,
+    STRATIFY_AGE_BIN_YEARS,
+    STRATIFY_TAIL_HIGH_MIN_AGE,
+    STRATIFY_TAIL_LOW_MAX_AGE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -186,6 +196,70 @@ def sample_mil_epoch_pseudo_bags(
     return pseudo_bags
 
 
+def sample_mil_epoch_weighted_subject_pseudo_bags(
+    balanced_sorted_indices,
+    balanced_offsets,
+    balanced_counts,
+    rng,
+    pseudo_bag_min_windows,
+    pseudo_bag_max_windows,
+    allow_replacement_when_small,
+    sampling_strategy,
+    eligible_subject_codes,
+    subject_sample_probs,
+    num_draws,
+):
+    """Sample ``num_draws`` pseudo-bags by drawing subjects with replacement (inverse-frequency weights).
+
+    Used for MIL **training** only so rare age strata appear as often in expectation as common ones.
+    """
+    n_eligible = int(eligible_subject_codes.shape[0])
+    if n_eligible == 0:
+        return []
+    draws = int(num_draws)
+    if draws <= 0:
+        return []
+
+    pick = rng.choice(n_eligible, size=draws, replace=True, p=subject_sample_probs)
+    bags = []
+    for j in pick:
+        subject_code = int(eligible_subject_codes[j])
+        bag_indices = sample_subject_pseudo_bag_indices(
+            sorted_indices=balanced_sorted_indices,
+            offsets=balanced_offsets,
+            counts=balanced_counts,
+            subject_code=subject_code,
+            rng=rng,
+            min_windows=pseudo_bag_min_windows,
+            max_windows=pseudo_bag_max_windows,
+            allow_replacement_when_small=allow_replacement_when_small,
+            sampling_strategy=sampling_strategy,
+        )
+        if bag_indices.size > 0:
+            bags.append((subject_code, bag_indices))
+
+    rng.shuffle(bags)
+    bag_sizes = np.asarray([b.size for _, b in bags], dtype=np.int32)
+    if bag_sizes.size == 0:
+        logger.warning("MIL weighted pseudo-bag sampler produced zero bags for this epoch.")
+        return bags
+
+    n_unique_subj = len({c for c, _ in bags})
+    logger.info(
+        "MIL weighted pseudo-bags | n_bags=%d | unique_subjects=%d | draws=%d | "
+        "bag_size[min/median/max]=%d/%d/%d | range=[%d,%d]",
+        bag_sizes.size,
+        n_unique_subj,
+        draws,
+        int(bag_sizes.min()),
+        int(np.median(bag_sizes)),
+        int(bag_sizes.max()),
+        pseudo_bag_min_windows,
+        pseudo_bag_max_windows,
+    )
+    return bags
+
+
 def build_mil_pseudo_bag_batch_iterator(
     x_mem,
     y_mem,
@@ -312,6 +386,14 @@ def run_mil_finetune_training(
     grad_clip_norm=0.0,
     encoder_warmup_epochs: int = 0,
     encoder_learning_rate: float | None = None,
+    subject_codebook: list[str] | None = None,
+    train_age_map: dict[str, float] | None = None,
+    subject_stratum_merged: dict[str, int] | None = None,
+    mil_inverse_frequency_subject_sampling: bool | None = None,
+    mil_subject_draws_per_epoch: int | None = None,
+    stratify_tail_low_max_age: float | None = None,
+    stratify_tail_high_min_age: float | None = None,
+    stratify_age_bin_years: float | None = None,
 ):
     """Run Step 3 full-model fine-tuning over stochastic pseudo-bags.
 
@@ -347,6 +429,16 @@ def run_mil_finetune_training(
         early_stopping_min_delta_abs (float): Absolute improvement threshold.
         early_stopping_min_delta_rel (float): Relative improvement threshold.
         grad_clip_norm (float): Max gradient norm (0 = disabled).
+        subject_codebook (list[str] | None): For inverse-frequency MIL sampling.
+        train_age_map (dict | None): Train subject -> age.
+        subject_stratum_merged (dict | None): Optional merged stratum ids (same as split/CNN).
+        mil_inverse_frequency_subject_sampling (bool | None): If True, weighted subject draws;
+            if None, use ``MIL_INVERSE_FREQUENCY_SUBJECT_SAMPLING`` from config.
+        mil_subject_draws_per_epoch (int | None): With replacement draws per epoch; None =
+            one per eligible subject (same cardinality as unweighted epoch).
+        stratify_tail_low_max_age (float | None): Age stratum boundary (None = config).
+        stratify_tail_high_min_age (float | None): Old tail boundary (None = config).
+        stratify_age_bin_years (float | None): Interior bin width (None = config).
 
     Returns:
         dict[str, Any]: Fine-tuning history and best-epoch metadata.
@@ -359,6 +451,46 @@ def run_mil_finetune_training(
     best_state_dict = None
     epochs_without_improvement = 0
 
+    use_mil_if = (
+        MIL_INVERSE_FREQUENCY_SUBJECT_SAMPLING
+        if mil_inverse_frequency_subject_sampling is None
+        else bool(mil_inverse_frequency_subject_sampling)
+    )
+    draws_cfg = MIL_SUBJECT_DRAWS_PER_EPOCH if mil_subject_draws_per_epoch is None else mil_subject_draws_per_epoch
+    tail_lo = STRATIFY_TAIL_LOW_MAX_AGE if stratify_tail_low_max_age is None else float(stratify_tail_low_max_age)
+    tail_hi = STRATIFY_TAIL_HIGH_MIN_AGE if stratify_tail_high_min_age is None else float(stratify_tail_high_min_age)
+    bin_y = STRATIFY_AGE_BIN_YEARS if stratify_age_bin_years is None else float(stratify_age_bin_years)
+
+    mil_eligible_codes = None
+    mil_subject_probs = None
+    mil_num_draws = None
+    if use_mil_if:
+        if subject_codebook is None or train_age_map is None:
+            logger.warning(
+                "MIL inverse-frequency subject sampling disabled: missing subject_codebook or train_age_map."
+            )
+            use_mil_if = False
+        else:
+            mil_eligible_codes, mil_subject_probs = build_mil_train_subject_inverse_frequency_probs(
+                balanced_counts=np.asarray(balanced_counts),
+                subject_codebook=subject_codebook,
+                train_age_map=train_age_map,
+                subject_stratum_merged=subject_stratum_merged,
+                tail_low_max_age=tail_lo,
+                tail_high_min_age=tail_hi,
+                bin_years=bin_y,
+            )
+            mil_num_draws = int(draws_cfg) if draws_cfg is not None else int(mil_eligible_codes.shape[0])
+            logger.info(
+                "MIL training | inverse-frequency subject sampling | eligible_subjects=%d | draws/epoch=%d "
+                "| strata use tail_lo=%.1f tail_hi=%.1f bin_y=%.1f",
+                int(mil_eligible_codes.shape[0]),
+                mil_num_draws,
+                tail_lo,
+                tail_hi,
+                bin_y,
+            )
+
     # Cache original encoder learning rate (if provided) so we can
     # restore it after the warmup "frozen" phase.
     encoder_group_lr = float(encoder_learning_rate) if encoder_learning_rate is not None else None
@@ -366,16 +498,31 @@ def run_mil_finetune_training(
     for epoch in range(epochs):
         mil_model.train()
 
-        pseudo_bags = sample_mil_epoch_pseudo_bags(
-            balanced_sorted_indices=balanced_sorted_indices,
-            balanced_offsets=balanced_offsets,
-            balanced_counts=balanced_counts,
-            rng=rng,
-            pseudo_bag_min_windows=pseudo_bag_min_windows,
-            pseudo_bag_max_windows=pseudo_bag_max_windows,
-            allow_replacement_when_small=allow_replacement_when_small,
-            sampling_strategy=sampling_strategy,
-        )
+        if use_mil_if and mil_eligible_codes is not None and mil_subject_probs is not None and mil_num_draws is not None:
+            pseudo_bags = sample_mil_epoch_weighted_subject_pseudo_bags(
+                balanced_sorted_indices=balanced_sorted_indices,
+                balanced_offsets=balanced_offsets,
+                balanced_counts=balanced_counts,
+                rng=rng,
+                pseudo_bag_min_windows=pseudo_bag_min_windows,
+                pseudo_bag_max_windows=pseudo_bag_max_windows,
+                allow_replacement_when_small=allow_replacement_when_small,
+                sampling_strategy=sampling_strategy,
+                eligible_subject_codes=mil_eligible_codes,
+                subject_sample_probs=mil_subject_probs,
+                num_draws=mil_num_draws,
+            )
+        else:
+            pseudo_bags = sample_mil_epoch_pseudo_bags(
+                balanced_sorted_indices=balanced_sorted_indices,
+                balanced_offsets=balanced_offsets,
+                balanced_counts=balanced_counts,
+                rng=rng,
+                pseudo_bag_min_windows=pseudo_bag_min_windows,
+                pseudo_bag_max_windows=pseudo_bag_max_windows,
+                allow_replacement_when_small=allow_replacement_when_small,
+                sampling_strategy=sampling_strategy,
+            )
         if len(pseudo_bags) == 0:
             raise ValueError("MIL fine-tuning received zero pseudo-bags. Check subject grouping inputs.")
 
@@ -536,6 +683,9 @@ def evaluate_mil_on_subject_bags(
     sampling_strategy,
 ):
     """Evaluate MIL model using one pseudo-bag per subject from eval split.
+
+    Uses **unweighted** subject coverage (every eval subject with windows once) so
+    metrics reflect the natural age mix of the split—not inverse-frequency training.
 
     Returns:
         dict[str, Any]: loss/r2/mae plus arrays and subject aggregations.
@@ -736,8 +886,13 @@ def run_tuning_trial(
     plot_max_points,
     grad_clip_norm=0.0,
     val_indices=None,
+    train_window_sample_weights=None,
+    use_age_weighted_window_sampling=False,
 ):
     """Train a short trial with candidate hyperparameters and return held-out metrics.
+
+    Tuning **minimizes** ``selection_mae``: validation window MAE when ``val_indices`` is set,
+    otherwise test window MAE. ``test_mae`` is always the test split for post-hoc reporting.
 
     Args:
         trial_idx (int): 1-based trial index.
@@ -805,7 +960,19 @@ def run_tuning_trial(
     )
     for epoch_idx in epoch_bar:
         model.train()
-        if subject_balanced_training and balanced_sorted_indices is not None:
+        if (
+            use_age_weighted_window_sampling
+            and train_window_sample_weights is not None
+            and train_window_sample_weights.shape[0] == train_indices.shape[0]
+        ):
+            epoch_train_indices = sample_weighted_train_epoch_indices(
+                train_indices,
+                train_window_sample_weights,
+                num_samples=int(train_indices.shape[0]),
+                rng=rng,
+                replace=True,
+            )
+        elif subject_balanced_training and balanced_sorted_indices is not None:
             epoch_train_indices = sample_balanced_train_indices(
                 sorted_indices=balanced_sorted_indices,
                 offsets=balanced_offsets,
@@ -964,6 +1131,8 @@ def train_model(
     reduce_lr_factor=0.5,
     min_lr=1e-6,
     grad_clip_norm=0.0,
+    train_window_sample_weights=None,
+    use_age_weighted_window_sampling=False,
 ):
     """Run full training loop with optional balanced sampling, validation, LR scheduler, and early stopping.
 
@@ -1036,7 +1205,19 @@ def train_model(
         epoch_targets_plot = []
         epoch_preds_plot = []
 
-        if subject_balanced_training and balanced_sorted_indices is not None:
+        if (
+            use_age_weighted_window_sampling
+            and train_window_sample_weights is not None
+            and train_window_sample_weights.shape[0] == train_indices.shape[0]
+        ):
+            epoch_train_indices = sample_weighted_train_epoch_indices(
+                train_indices,
+                train_window_sample_weights,
+                num_samples=int(train_indices.shape[0]),
+                rng=rng,
+                replace=True,
+            )
+        elif subject_balanced_training and balanced_sorted_indices is not None:
             epoch_train_indices = sample_balanced_train_indices(
                 sorted_indices=balanced_sorted_indices,
                 offsets=balanced_offsets,

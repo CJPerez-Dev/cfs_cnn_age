@@ -103,6 +103,27 @@ def parse_args():
         dest="auto_split",
         help="Use AgeTraining_Key.csv and AgeTesting_Key.csv for train/test split instead of auto-split.",
     )
+    parser.add_argument(
+        "--no-age-stratified-split",
+        dest="age_stratified_split",
+        action="store_false",
+        default=True,
+        help="Disable age-stratified train/val/test subject split (auto-split only; uses random shuffle).",
+    )
+    parser.add_argument(
+        "--no-age-weighted-window-sampling",
+        dest="age_weighted_window_sampling",
+        action="store_false",
+        default=True,
+        help="Disable inverse-frequency age-stratum sampling for CNN training windows (WeightedRandomSampler-style).",
+    )
+    parser.add_argument(
+        "--no-mil-inverse-frequency-subject-sampling",
+        dest="mil_inverse_frequency_subject_sampling",
+        action="store_false",
+        default=True,
+        help="Disable MIL train: inverse-frequency subject draws (use one bag per subject per epoch).",
+    )
 
     parser.add_argument("--mil-finetune", action="store_true", help="Enable MIL Step 3 fine-tuning mode (unfreeze encoder + train full MIL model).")
     parser.add_argument("--mil-pretrained-model", type=str, default=None, help="Optional path to pretrained CNN checkpoint used to initialize MIL encoder.")

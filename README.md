@@ -205,7 +205,15 @@ repository's `input/` folder so the CNN pipeline can access them.
 
 **Train/val/test split (default: auto-split)**
 
-By default the pipeline uses **auto-split**: a 70/15/15 subject-level train/validation/test split. In this mode you do **not** need separate training and testing key files. You must provide subject ages in one of these ways:
+By default the pipeline uses **auto-split**: a 70/15/15 subject-level train/validation/test split. In this mode you do **not** need separate training and testing key files.
+
+**Age stratification (default on):** subjects are assigned to age strata (one stratum for ages **below** `stratify_tail_low_max_age`, one collapsed stratum for **≥** `stratify_tail_high_min_age` (default **80**), and **5-year** bands in between—see `cnn_age_project/config.py`). Sparse strata are **merged** with neighbors until each has at least `stratify_min_subjects_per_stratum` subjects so train/val/test can all receive representation. Stratified splits use a **separate memmap cache** suffix (`*_auto_strat*` vs `*_auto*`). Disable with `--no-age-stratified-split` (random subject shuffle).
+
+**CNN training—balanced ages:** by default each epoch resamples training windows with probability proportional to **inverse stratum frequency** (same band definitions as above), similar to PyTorch `WeightedRandomSampler`. This **overrides** per-epoch subject-balanced window caps for the CNN loop when enabled; disable with `--no-age-weighted-window-sampling`.
+
+**MIL training—balanced ages (subject-level):** by default each epoch draws train subjects **with replacement** with probability **∝ 1 / (number of train subjects in that age stratum)**, so each stratum gets equal aggregate sampling mass (same strata as above). **Validation/test MIL** still uses **one unweighted bag per subject** (natural age mix). Disable MIL weighting with `--no-mil-inverse-frequency-subject-sampling`.
+
+You must provide subject ages in one of these ways:
 
 - **Option A:** A single key CSV in `input/` named `AgeKey.csv` (or the filename set in config `subject_key_filename`) with columns `SubjectID` and `VariableValue` (age). You can merge train and test key files into one using `scripts/merge_key_files.py`.
 - **Option B:** A column in `meta_T1281.csv` named `age`, `Age`, or `VariableValue` that contains age per row (subject ages are inferred from metadata).

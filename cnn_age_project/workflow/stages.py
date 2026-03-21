@@ -34,6 +34,8 @@ from cnn_age_project.config import (
     MIL_FINETUNE_ENCODER_WARMUP_EPOCHS,
     MIL_FINETUNE_HEAD_LR,
     MIL_FINETUNE_WEIGHT_DECAY,
+    MIL_INVERSE_FREQUENCY_SUBJECT_SAMPLING,
+    MIL_SUBJECT_DRAWS_PER_EPOCH,
     MIL_PSEUDO_BAG_MAX_WINDOWS,
     MIL_PSEUDO_BAG_MIN_WINDOWS,
     MAX_WINDOWS_PER_SUBJECT_PER_EPOCH,
@@ -63,6 +65,12 @@ from cnn_age_project.config import (
     USE_TF32,
     USE_TORCH_COMPILE,
     USE_AUTO_SPLIT,
+    USE_AGE_STRATIFIED_SPLIT,
+    STRATIFY_AGE_BIN_YEARS,
+    STRATIFY_TAIL_LOW_MAX_AGE,
+    STRATIFY_TAIL_HIGH_MIN_AGE,
+    STRATIFY_MIN_SUBJECTS_PER_STRATUM,
+    AGE_WEIGHTED_WINDOW_SAMPLING,
     VALIDATION_KEY_CSV,
     SPLIT_RATIO_TRAIN,
     SPLIT_RATIO_VAL,
@@ -84,6 +92,12 @@ from cnn_age_project.config import (
     DEFAULT_MODEL_PATH,
     DEFAULT_HPARAMS_PATH,
 )
+from cnn_age_project.data.age_strata import (
+    build_merged_strata_for_subjects,
+    build_subject_code_stratum_lookup,
+    log_stratum_summary,
+    split_subjects_stratified_train_val_test,
+)
 from cnn_age_project.data.data_io import (
     build_or_load_targets_and_split,
     build_subject_age_map_from_metadata,
@@ -93,7 +107,10 @@ from cnn_age_project.data.data_io import (
     validate_subject_wise_split_integrity,
     validate_required_project_files,
 )
-from cnn_age_project.data.dataset import build_subject_group_index
+from cnn_age_project.data.dataset import (
+    build_subject_group_index,
+    compute_train_window_stratum_sample_weights,
+)
 from cnn_age_project.data.preprocessing import compute_target_norm_stats, estimate_input_norm_stats
 from cnn_age_project.evaluation.evaluation import (
     bootstrap_ci_subject_metrics,
@@ -185,6 +202,10 @@ def _run_candidate_trial(
             plot_max_points=PLOT_MAX_POINTS,
             grad_clip_norm=GRAD_CLIP_NORM,
             val_indices=data_ctx.val_indices,
+            train_window_sample_weights=norm_ctx.train_window_sample_weights,
+            use_age_weighted_window_sampling=bool(
+                getattr(args, "age_weighted_window_sampling", AGE_WEIGHTED_WINDOW_SAMPLING)
+            ),
         )
 
     if mode_for_tune == "mil":
@@ -198,6 +219,7 @@ def _run_candidate_trial(
             runtime_ctx=runtime_ctx,
             rng=np.random.default_rng(RANDOM_SEED + trial_idx),
             base_cnn_state_dict=base_cnn_state_dict,
+            args=args,
         )
 
     if mode_for_tune == "both":
@@ -231,6 +253,10 @@ def _run_candidate_trial(
             plot_max_points=PLOT_MAX_POINTS,
             grad_clip_norm=GRAD_CLIP_NORM,
             val_indices=data_ctx.val_indices,
+            train_window_sample_weights=norm_ctx.train_window_sample_weights,
+            use_age_weighted_window_sampling=bool(
+                getattr(args, "age_weighted_window_sampling", AGE_WEIGHTED_WINDOW_SAMPLING)
+            ),
         )
         mil_result = _run_mil_tuning_trial(
             trial_idx=trial_idx,
@@ -242,15 +268,20 @@ def _run_candidate_trial(
             runtime_ctx=runtime_ctx,
             rng=np.random.default_rng(RANDOM_SEED + 10_000 + trial_idx),
             base_cnn_state_dict=base_cnn_state_dict,
+            args=args,
         )
-        combined_mae = 0.5 * (cnn_result["test_mae"] + mil_result["test_mae"])
+        cnn_sel = float(cnn_result.get("selection_mae", cnn_result["test_mae"]))
+        mil_sel = float(mil_result.get("selection_mae", mil_result["test_mae"]))
+        combined_selection = 0.5 * (cnn_sel + mil_sel)
+        combined_test = 0.5 * (float(cnn_result["test_mae"]) + float(mil_result["test_mae"]))
         return {
             "hparams": candidate,
-            "test_mae": float(combined_mae),
+            "selection_mae": float(combined_selection),
+            "test_mae": float(combined_test),
             "test_r2": np.nan,
             "test_loss": np.nan,
             "trial_seconds": float(cnn_result["trial_seconds"] + mil_result["trial_seconds"]),
-            "combined_metric": "mean_test_mae",
+            "combined_metric": "mean_val_mae",
             "cnn": cnn_result,
             "mil": mil_result,
             "model_type": "both",
@@ -297,6 +328,9 @@ def setup_runtime_context(args=None):
         RuntimeContext: Runtime device information and cache paths.
     """
     use_auto_split = getattr(args, "auto_split", USE_AUTO_SPLIT) if args is not None else USE_AUTO_SPLIT
+    use_age_stratified = USE_AGE_STRATIFIED_SPLIT
+    if args is not None:
+        use_age_stratified = bool(getattr(args, "age_stratified_split", use_age_stratified))
 
     log_stage("Preflight Checks", logger)
     memmap_root = validate_required_project_files(INPUT_DIR, OUTPUT_DIR, use_auto_split=use_auto_split)
@@ -309,10 +343,11 @@ def setup_runtime_context(args=None):
         base_a, ext_a = os.path.splitext(AGE_TARGET_CACHE_FILE)
         base_c, ext_c = os.path.splitext(SUBJECT_CODE_CACHE_FILE)
         base_cb, ext_cb = os.path.splitext(SUBJECT_CODEBOOK_FILE)
-        split_cache_path = os.path.join(OUTPUT_DIR, base_s + "_auto" + ext_s)
-        age_cache_path = os.path.join(OUTPUT_DIR, base_a + "_auto" + ext_a)
-        subject_code_cache_path = os.path.join(OUTPUT_DIR, base_c + "_auto" + ext_c)
-        subject_codebook_path = os.path.join(OUTPUT_DIR, base_cb + "_auto" + ext_cb)
+        auto_tag = "_auto_strat" if use_age_stratified else "_auto"
+        split_cache_path = os.path.join(OUTPUT_DIR, base_s + auto_tag + ext_s)
+        age_cache_path = os.path.join(OUTPUT_DIR, base_a + auto_tag + ext_a)
+        subject_code_cache_path = os.path.join(OUTPUT_DIR, base_c + auto_tag + ext_c)
+        subject_codebook_path = os.path.join(OUTPUT_DIR, base_cb + auto_tag + ext_cb)
     else:
         split_cache_path = os.path.join(OUTPUT_DIR, SPLIT_CACHE_FILE)
         age_cache_path = os.path.join(OUTPUT_DIR, AGE_TARGET_CACHE_FILE)
@@ -350,6 +385,11 @@ def load_data_context(runtime_ctx: RuntimeContext, args=None):
 
     log_stage("Label + Split Preparation", logger)
     use_auto_split = getattr(args, "auto_split", USE_AUTO_SPLIT) if args is not None else USE_AUTO_SPLIT
+    use_age_stratified = USE_AGE_STRATIFIED_SPLIT
+    if args is not None:
+        use_age_stratified = bool(getattr(args, "age_stratified_split", use_age_stratified))
+
+    subject_stratum_merged: dict[str, int] | None = None
 
     if use_auto_split:
         # 70/15/15 (or configured ratios) subject split from metadata; key files ignored.
@@ -369,19 +409,47 @@ def load_data_context(runtime_ctx: RuntimeContext, args=None):
                 "Provide a single key CSV (config.subject_key_filename) with SubjectID, VariableValue, "
                 "or add an age column (age, Age, or VariableValue) to the metadata CSV."
             )
-        subject_ids = list(subject_age.keys())
         rng_split = np.random.default_rng(RANDOM_SEED)
-        train_ids, val_ids, test_ids = split_subjects_ratio(
-            subject_ids,
-            SPLIT_RATIO_TRAIN,
-            SPLIT_RATIO_VAL,
-            SPLIT_RATIO_TEST,
-            rng_split,
-        )
+        if use_age_stratified:
+            subject_stratum_merged = build_merged_strata_for_subjects(
+                subject_age,
+                STRATIFY_TAIL_LOW_MAX_AGE,
+                STRATIFY_TAIL_HIGH_MIN_AGE,
+                STRATIFY_AGE_BIN_YEARS,
+                STRATIFY_MIN_SUBJECTS_PER_STRATUM,
+            )
+            log_stratum_summary(subject_age, subject_stratum_merged)
+            train_ids, val_ids, test_ids = split_subjects_stratified_train_val_test(
+                subject_age,
+                subject_stratum_merged,
+                SPLIT_RATIO_TRAIN,
+                SPLIT_RATIO_VAL,
+                SPLIT_RATIO_TEST,
+                rng_split,
+            )
+            logger.info(
+                "Age-stratified split | train=%d val=%d test=%d subjects | bands=%.0fy tails <%.0f / >=%.0f min/stratum=%d",
+                len(train_ids),
+                len(val_ids),
+                len(test_ids),
+                STRATIFY_AGE_BIN_YEARS,
+                STRATIFY_TAIL_LOW_MAX_AGE,
+                STRATIFY_TAIL_HIGH_MIN_AGE,
+                STRATIFY_MIN_SUBJECTS_PER_STRATUM,
+            )
+        else:
+            subject_ids = list(subject_age.keys())
+            train_ids, val_ids, test_ids = split_subjects_ratio(
+                subject_ids,
+                SPLIT_RATIO_TRAIN,
+                SPLIT_RATIO_VAL,
+                SPLIT_RATIO_TEST,
+                rng_split,
+            )
+            logger.info("Random split | train=%d val=%d test=%d subjects", len(train_ids), len(val_ids), len(test_ids))
         train_age_map = {s: subject_age[s] for s in train_ids}
         test_age_map = {s: subject_age[s] for s in test_ids}
         val_age_map = {s: subject_age[s] for s in val_ids}
-        logger.info("Split | train=%d val=%d test=%d subjects", len(train_age_map), len(val_age_map), len(test_age_map))
     else:
         if not os.path.exists(TRAIN_KEY_CSV) or not os.path.exists(TEST_KEY_CSV):
             raise FileNotFoundError("Training/testing key CSV files were not found in input folder.")
@@ -391,6 +459,7 @@ def load_data_context(runtime_ctx: RuntimeContext, args=None):
         if len(overlap_subjects) > 0:
             raise ValueError(f"Train/test subject overlap detected: {len(overlap_subjects)} subjects.")
         val_age_map = None
+        subject_stratum_merged = None
         validation_csv_path = None
         if getattr(args, "validation_key", None):
             validation_csv_path = os.path.join(INPUT_DIR, args.validation_key)
@@ -463,15 +532,17 @@ def load_data_context(runtime_ctx: RuntimeContext, args=None):
         subject_codebook=subject_codebook,
         val_age_map=val_age_map,
         val_indices=val_indices,
+        subject_stratum_merged=subject_stratum_merged,
     )
 
 
-def setup_normalization_context(data_ctx: DataContext, rng):
+def setup_normalization_context(data_ctx: DataContext, rng, args=None):
     """Compute normalization statistics and optional subject-balanced index structures.
 
     Args:
         data_ctx (DataContext): Loaded training/testing data context.
         rng (np.random.Generator): Random generator for sampling normalization windows.
+        args (argparse.Namespace | None): Optional CLI args for sampling overrides.
 
     Returns:
         NormalizationContext: Normalization values and balanced-sampling structures.
@@ -511,6 +582,45 @@ def setup_normalization_context(data_ctx: DataContext, rng):
         )
         logger.debug("Subject-balanced: max_windows/subject=%d subjects=%d", MAX_WINDOWS_PER_SUBJECT_PER_EPOCH, int(np.sum(balanced_counts > 0)))
 
+    use_age_weighted = AGE_WEIGHTED_WINDOW_SAMPLING
+    if args is not None:
+        use_age_weighted = bool(getattr(args, "age_weighted_window_sampling", use_age_weighted))
+
+    train_window_sample_weights = None
+    if use_age_weighted:
+        merged = data_ctx.subject_stratum_merged
+        if merged is None:
+            merged = build_merged_strata_for_subjects(
+                dict(data_ctx.train_age_map),
+                STRATIFY_TAIL_LOW_MAX_AGE,
+                STRATIFY_TAIL_HIGH_MIN_AGE,
+                STRATIFY_AGE_BIN_YEARS,
+                STRATIFY_MIN_SUBJECTS_PER_STRATUM,
+            )
+        lookup = build_subject_code_stratum_lookup(
+            data_ctx.subject_codebook,
+            data_ctx.train_age_map,
+            merged,
+            STRATIFY_TAIL_LOW_MAX_AGE,
+            STRATIFY_TAIL_HIGH_MIN_AGE,
+            STRATIFY_AGE_BIN_YEARS,
+        )
+        train_window_sample_weights = compute_train_window_stratum_sample_weights(
+            data_ctx.train_indices,
+            data_ctx.subject_codes,
+            lookup,
+        )
+        logger.info(
+            "Age-weighted window sampling (inverse stratum frequency) | n_train_windows=%d mean_weight=%.4f",
+            int(data_ctx.train_indices.shape[0]),
+            float(np.mean(train_window_sample_weights)),
+        )
+        if SUBJECT_BALANCED_TRAINING:
+            logger.info(
+                "Subject-balanced sampling is superseded by age-weighted sampling for CNN epoch indices "
+                "(subject-balanced structures are still built for MIL)."
+            )
+
     return NormalizationContext(
         x_mean=x_mean,
         x_std=x_std,
@@ -519,6 +629,7 @@ def setup_normalization_context(data_ctx: DataContext, rng):
         balanced_sorted_indices=balanced_sorted_indices,
         balanced_offsets=balanced_offsets,
         balanced_counts=balanced_counts,
+        train_window_sample_weights=train_window_sample_weights,
     )
 
 
@@ -552,8 +663,13 @@ def _run_mil_tuning_trial(
     runtime_ctx,
     rng,
     base_cnn_state_dict,
+    args,
 ):
-    """Run one MIL hyperparameter tuning trial and return held-out metrics."""
+    """Run one MIL hyperparameter tuning trial and return held-out metrics.
+
+    Model selection for tuning uses **validation** subject-bag MAE when a val split
+    exists; otherwise falls back to test MAE (with a warning).
+    """
     trial_start = perf_counter()
     logger.info("MIL tune trial %d/%d", trial_idx, total_trials)
 
@@ -637,8 +753,16 @@ def _run_mil_tuning_trial(
         sampling_strategy=sampling_strategy,
         debug_chunk_log_every=DEBUG_CHUNK_LOG_EVERY,
         amp_enabled=amp_enabled,
+        subject_codebook=data_ctx.subject_codebook,
+        train_age_map=data_ctx.train_age_map,
+        subject_stratum_merged=data_ctx.subject_stratum_merged,
+        mil_inverse_frequency_subject_sampling=bool(
+            getattr(args, "mil_inverse_frequency_subject_sampling", MIL_INVERSE_FREQUENCY_SUBJECT_SAMPLING)
+        ),
+        mil_subject_draws_per_epoch=MIL_SUBJECT_DRAWS_PER_EPOCH,
     )
 
+    # Test split: reported only (do not use for hyperparameter selection).
     eval_metrics = evaluate_mil_on_subject_bags(
         mil_model=training["model"],
         criterion=criterion,
@@ -661,23 +785,69 @@ def _run_mil_tuning_trial(
         sampling_strategy=sampling_strategy,
     )
 
+    val_metrics = None
+    if data_ctx.val_indices is not None and data_ctx.val_indices.size > 0:
+        val_metrics = evaluate_mil_on_subject_bags(
+            mil_model=training["model"],
+            criterion=criterion,
+            x_mem=data_ctx.x_mem,
+            y_mem=data_ctx.y_mem,
+            eval_indices=data_ctx.val_indices,
+            subject_codes=data_ctx.subject_codes,
+            n_subjects=len(data_ctx.subject_codebook),
+            batch_size=MIL_BAG_BATCH_SIZE,
+            device=runtime_ctx.device,
+            x_mean=norm_ctx.x_mean,
+            x_std=norm_ctx.x_std,
+            y_mean=norm_ctx.y_mean,
+            y_std=norm_ctx.y_std,
+            normalize_target=NORMALIZE_TARGET,
+            rng=rng,
+            pseudo_bag_min_windows=bag_size,
+            pseudo_bag_max_windows=bag_size,
+            allow_replacement_when_small=MIL_ALLOW_REPLACEMENT_WHEN_SMALL,
+            sampling_strategy=sampling_strategy,
+        )
+        selection_mae = float(val_metrics["test_mae"])
+    else:
+        selection_mae = float(eval_metrics["test_mae"])
+
     trial_seconds = perf_counter() - trial_start
-    logger.info(
-        "[Tune %d/%d] MIL trial completed in %.1fs | test_mae=%.3f test_r2=%.4f",
-        trial_idx,
-        total_trials,
-        trial_seconds,
-        eval_metrics["test_mae"],
-        eval_metrics["test_r2"],
-    )
-    return {
+    if val_metrics is not None:
+        logger.info(
+            "[Tune %d/%d] MIL trial completed in %.1fs | val_mae=%.3f (selection) test_mae=%.3f test_r2=%.4f",
+            trial_idx,
+            total_trials,
+            trial_seconds,
+            selection_mae,
+            eval_metrics["test_mae"],
+            eval_metrics["test_r2"],
+        )
+    else:
+        logger.info(
+            "[Tune %d/%d] MIL trial completed in %.1fs | selection_mae=%.3f test_mae=%.3f test_r2=%.4f",
+            trial_idx,
+            total_trials,
+            trial_seconds,
+            selection_mae,
+            eval_metrics["test_mae"],
+            eval_metrics["test_r2"],
+        )
+
+    out = {
         "hparams": hparams,
         "test_loss": float(eval_metrics["test_loss"]),
         "test_r2": float(eval_metrics["test_r2"]) if np.isfinite(eval_metrics["test_r2"]) else np.nan,
         "test_mae": float(eval_metrics["test_mae"]),
+        "selection_mae": selection_mae,
         "trial_seconds": float(trial_seconds),
         "model_type": "mil",
     }
+    if val_metrics is not None:
+        out["val_mae"] = selection_mae
+        out["val_loss"] = float(val_metrics["test_loss"])
+        out["val_r2"] = float(val_metrics["test_r2"]) if np.isfinite(val_metrics["test_r2"]) else np.nan
+    return out
 
 
 def select_hyperparameters(args, data_ctx: DataContext, norm_ctx: NormalizationContext, runtime_ctx: RuntimeContext, run_ctx: RunContext = None):
@@ -746,6 +916,17 @@ def select_hyperparameters(args, data_ctx: DataContext, norm_ctx: NormalizationC
             max_trials,
             args.tune_epochs,
         )
+        val_ok = data_ctx.val_indices is not None and data_ctx.val_indices.size > 0
+        if val_ok:
+            logger.info(
+                "Tuning minimizes selection_mae on the **validation** set (CNN: window MAE; MIL: subject-bag MAE; "
+                "test metrics are logged only)."
+            )
+        else:
+            logger.warning(
+                "No validation split — selection_mae falls back to **test** MAE for CNN/MIL/both (test-informed "
+                "model choice). Prefer auto-split with val or AgeValidation_Key.csv."
+            )
         tuning_results = []
         tuning_start = perf_counter()
         best_so_far = None
@@ -1100,6 +1281,17 @@ def run_training_stage(
             grad_clip_norm=GRAD_CLIP_NORM,
             encoder_warmup_epochs=int(MIL_FINETUNE_ENCODER_WARMUP_EPOCHS),
             encoder_learning_rate=float(active_hparams.get("mil_encoder_lr", MIL_FINETUNE_ENCODER_LR)),
+            subject_codebook=data_ctx.subject_codebook,
+            train_age_map=data_ctx.train_age_map,
+            subject_stratum_merged=data_ctx.subject_stratum_merged,
+            mil_inverse_frequency_subject_sampling=bool(
+                getattr(args, "mil_inverse_frequency_subject_sampling", MIL_INVERSE_FREQUENCY_SUBJECT_SAMPLING)
+            ),
+            mil_subject_draws_per_epoch=(
+                int(active_hparams["mil_subject_draws_per_epoch"])
+                if active_hparams.get("mil_subject_draws_per_epoch") is not None
+                else MIL_SUBJECT_DRAWS_PER_EPOCH
+            ),
         )
 
         return TrainingContext(
@@ -1134,6 +1326,10 @@ def run_training_stage(
 
     log_stage("Model Training", logger)
     logging.info("Starting training...")
+
+    use_aw = AGE_WEIGHTED_WINDOW_SAMPLING
+    if args is not None:
+        use_aw = bool(getattr(args, "age_weighted_window_sampling", use_aw))
 
     training = train_model(
         model=model,
@@ -1172,6 +1368,8 @@ def run_training_stage(
         reduce_lr_factor=REDUCE_LR_FACTOR,
         min_lr=MIN_LR,
         grad_clip_norm=GRAD_CLIP_NORM,
+        train_window_sample_weights=norm_ctx.train_window_sample_weights,
+        use_age_weighted_window_sampling=use_aw,
     )
 
     return TrainingContext(
@@ -1385,6 +1583,7 @@ def save_artifacts_and_summary(
     run_ctx: RunContext,
     runtime_ctx: RuntimeContext,
     data_ctx: DataContext,
+    norm_ctx: NormalizationContext,
     hparam_ctx: HyperparameterContext,
     train_ctx: TrainingContext,
     eval_ctx: EvaluationContext,
@@ -1396,6 +1595,7 @@ def save_artifacts_and_summary(
         run_ctx (RunContext): Run metadata context.
         runtime_ctx (RuntimeContext): Runtime context.
         data_ctx (DataContext): Data context.
+        norm_ctx (NormalizationContext): Normalization / sampling context.
         hparam_ctx (HyperparameterContext): Hyperparameter context.
         train_ctx (TrainingContext): Training stage outputs.
         eval_ctx (EvaluationContext): Evaluation stage outputs.
@@ -1451,6 +1651,16 @@ def save_artifacts_and_summary(
         "normalize_target": NORMALIZE_TARGET,
         "clip_predicted_age_after_denorm": CLIP_PREDICTED_AGE_AFTER_DENORM,
         "min_predicted_age_years": MIN_PREDICTED_AGE_YEARS,
+        "use_age_stratified_split": USE_AGE_STRATIFIED_SPLIT,
+        "age_stratified_split_applied": data_ctx.subject_stratum_merged is not None,
+        "stratify_age_bin_years": STRATIFY_AGE_BIN_YEARS,
+        "stratify_tail_low_max_age": STRATIFY_TAIL_LOW_MAX_AGE,
+        "stratify_tail_high_min_age": STRATIFY_TAIL_HIGH_MIN_AGE,
+        "stratify_min_subjects_per_stratum": STRATIFY_MIN_SUBJECTS_PER_STRATUM,
+        "age_weighted_window_sampling": AGE_WEIGHTED_WINDOW_SAMPLING,
+        "age_weighted_window_weights_built": norm_ctx.train_window_sample_weights is not None,
+        "mil_inverse_frequency_subject_sampling": MIL_INVERSE_FREQUENCY_SUBJECT_SAMPLING,
+        "mil_subject_draws_per_epoch_config": MIL_SUBJECT_DRAWS_PER_EPOCH,
         "subject_balanced_training": SUBJECT_BALANCED_TRAINING,
         "max_windows_per_subject_per_epoch": hparam_ctx.active_max_windows_per_subject,
         "tf32_enabled": USE_TF32,
@@ -1564,7 +1774,7 @@ def execute_full_workflow(args):
     run_ctx = initialize_run_context()
     runtime_ctx = setup_runtime_context(args)
     data_ctx = load_data_context(runtime_ctx, args)
-    norm_ctx = setup_normalization_context(data_ctx, run_ctx.rng)
+    norm_ctx = setup_normalization_context(data_ctx, run_ctx.rng, args=args)
     model_labels = _resolve_model_modes(args)
 
     # Preconditions for defaults: if the run includes MIL, require a pretrained
@@ -1654,6 +1864,7 @@ def execute_full_workflow(args):
             model_run_ctx,
             runtime_ctx,
             data_ctx,
+            norm_ctx,
             model_hparam_ctx,
             train_ctx,
             eval_ctx,

@@ -63,6 +63,8 @@ class DataContext:
         subject_codebook: Subject ID lookup by code.
         val_age_map: Optional validation subject->age mapping (None if no validation set).
         val_indices: Optional validation window indices (None or empty if no validation set).
+        subject_stratum_merged: Optional merged age-stratum id per subject when stratified
+            auto-split was used (used for weighted window sampling aligned with split strata).
     """
     x_mem: np.memmap
     y_mem: np.memmap
@@ -77,6 +79,7 @@ class DataContext:
     subject_codebook: list[str]
     val_age_map: dict[str, float] | None = None
     val_indices: np.ndarray | None = None
+    subject_stratum_merged: dict[str, int] | None = None
 
 
 @dataclass
@@ -91,6 +94,7 @@ class NormalizationContext:
         balanced_sorted_indices: Subject-sorted training indices.
         balanced_offsets: Per-subject offsets into sorted indices.
         balanced_counts: Per-subject training-window counts.
+        train_window_sample_weights: Per-train-index inverse-stratum weights for weighted epoch sampling.
     """
     x_mean: float
     x_std: float
@@ -99,6 +103,7 @@ class NormalizationContext:
     balanced_sorted_indices: np.ndarray | None
     balanced_offsets: np.ndarray | None
     balanced_counts: np.ndarray | None
+    train_window_sample_weights: np.ndarray | None = None
 
 
 @dataclass

@@ -90,6 +90,26 @@ class Config:
     # use_auto_split, age is read from metadata if a column "age", "Age", or "VariableValue" exists.
     subject_key_filename: str | None = None
 
+    # Age-stratified train/val/test when use_auto_split is True (ignored for manual key CSVs).
+    # Interior: 5-year bands between tail boundaries; tails are single strata each. Sparse bands
+    # are merged until each stratum has at least stratify_min_subjects_per_stratum subjects.
+    use_age_stratified_split: bool = True
+    stratify_age_bin_years: float = 5.0
+    stratify_tail_low_max_age: float = 20.0
+    # Ages >= this form one collapsed "old tail" stratum (with 5-year bins below, young tail below tail_low).
+    stratify_tail_high_min_age: float = 80.0
+    stratify_min_subjects_per_stratum: int = 3
+
+    # MIL training: each epoch draw subjects with replacement, prob ∝ 1 / (subjects in age stratum).
+    # Gives rare age bins equal aggregate sampling mass per epoch. Val/test MIL eval stays unweighted.
+    mil_inverse_frequency_subject_sampling: bool = True
+    # None = one draw per eligible train subject per epoch (same count as "all subjects", but weighted).
+    mil_subject_draws_per_epoch: int | None = None
+
+    # CNN training: sample windows with probability ∝ inverse stratum frequency (WeightedRandomSampler-style).
+    # Takes precedence over subject_balanced_training when both are enabled.
+    age_weighted_window_sampling: bool = True
+
     # Learning rate scheduler: "none", "plateau" (ReduceLROnPlateau on val loss), or "cosine"
     lr_scheduler: str = "plateau"
     reduce_lr_patience: int = 3
@@ -256,6 +276,14 @@ SPLIT_RATIO_TRAIN = CONFIG.split_ratio_train
 SPLIT_RATIO_VAL = CONFIG.split_ratio_val
 SPLIT_RATIO_TEST = CONFIG.split_ratio_test
 SUBJECT_KEY_FILENAME = CONFIG.subject_key_filename
+USE_AGE_STRATIFIED_SPLIT = CONFIG.use_age_stratified_split
+STRATIFY_AGE_BIN_YEARS = CONFIG.stratify_age_bin_years
+STRATIFY_TAIL_LOW_MAX_AGE = CONFIG.stratify_tail_low_max_age
+STRATIFY_TAIL_HIGH_MIN_AGE = CONFIG.stratify_tail_high_min_age
+STRATIFY_MIN_SUBJECTS_PER_STRATUM = CONFIG.stratify_min_subjects_per_stratum
+AGE_WEIGHTED_WINDOW_SAMPLING = CONFIG.age_weighted_window_sampling
+MIL_INVERSE_FREQUENCY_SUBJECT_SAMPLING = CONFIG.mil_inverse_frequency_subject_sampling
+MIL_SUBJECT_DRAWS_PER_EPOCH = CONFIG.mil_subject_draws_per_epoch
 SUBJECT_KEY_CSV = (
     os.path.join(CONFIG.input_dir, CONFIG.subject_key_filename)
     if CONFIG.subject_key_filename

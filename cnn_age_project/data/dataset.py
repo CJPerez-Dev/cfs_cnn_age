@@ -63,6 +63,46 @@ def sample_balanced_train_indices(sorted_indices, offsets, counts, max_per_subje
     return sampled
 
 
+def compute_train_window_stratum_sample_weights(
+    train_indices,
+    subject_codes,
+    code_stratum_lookup,
+):
+    """Inverse-frequency weights per train row (aligned with ``train_indices`` order).
+
+    Each window inherits the stratum of its subject (via ``code_stratum_lookup``).
+    Weight for stratum s is proportional to 1 / (# train windows in s), then mean-normalized.
+    """
+    if train_indices.shape[0] == 0:
+        return np.array([], dtype=np.float64)
+    codes = np.asarray(subject_codes[np.asarray(train_indices, dtype=np.int64)], dtype=np.int64)
+    n_codes = int(code_stratum_lookup.shape[0])
+    valid = (codes >= 0) & (codes < n_codes)
+    strata = np.zeros(train_indices.shape[0], dtype=np.int64)
+    strata[valid] = code_stratum_lookup[codes[valid]]
+    max_st = int(strata.max()) if strata.size else 0
+    counts = np.bincount(strata, minlength=max_st + 1).astype(np.float64)
+    counts = np.maximum(counts, 1.0)
+    w = 1.0 / counts[strata]
+    w = w / np.mean(w)
+    return w.astype(np.float64)
+
+
+def sample_weighted_train_epoch_indices(train_indices, weights, num_samples, rng, replace=True):
+    """Draw ``num_samples`` global row indices with probability ∝ ``weights``.
+
+    Mirrors ``torch.utils.data.WeightedRandomSampler`` (multinomial with replacement by default).
+    """
+    if train_indices.shape[0] == 0:
+        return train_indices
+    if weights.shape[0] != train_indices.shape[0]:
+        raise ValueError("weights must have the same length as train_indices.")
+    p = np.asarray(weights, dtype=np.float64)
+    p = p / p.sum()
+    pos = rng.choice(len(train_indices), size=int(num_samples), replace=replace, p=p)
+    return train_indices[pos]
+
+
 def iter_memmap_batches(x_mem, y_mem, indices, batch_size, x_mean=0.0, x_std=1.0):
     """Yield normalized tensor batches from memmap arrays for a set of indices.
 
