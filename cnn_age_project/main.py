@@ -65,6 +65,18 @@ def parse_args():
         help="Random seed for Optuna sampler.",
     )
     parser.add_argument("--hparams-file", type=str, default=None, help="Path to a JSON file with hyperparameters to use for training (overrides saved defaults).")
+    parser.add_argument(
+        "--cnn-hparams-file",
+        type=str,
+        default=None,
+        help="Optional CNN hyperparameters JSON (used when --model-mode both). If set, overrides --hparams-file for the CNN run only.",
+    )
+    parser.add_argument(
+        "--mil-hparams-file",
+        type=str,
+        default=None,
+        help="Optional MIL hyperparameters JSON (used when --model-mode both). If set, overrides --hparams-file for the MIL run only.",
+    )
     parser.add_argument("--tune-name", type=str, default=None, help="Optional name to attach to tuning results/best-hparams output when --tune is used.")
     parser.add_argument(
         "--model-mode",

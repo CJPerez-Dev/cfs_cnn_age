@@ -63,10 +63,12 @@ Thumbs.db
 input/
 output/
 
+# ignore default model
+defaults/default_model.pt
+
 # but keep these
 !input/README.md
 !output/README.md
-!output/hparams/best_hyperparameters.json
 
 # Temporary docs and exported images (optional)
 docs/_build/

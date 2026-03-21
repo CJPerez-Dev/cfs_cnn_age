@@ -94,8 +94,6 @@ def save_training_report(
         axes[1, 1].scatter(final_targets, final_preds, alpha=0.15)
         min_age = min(final_targets.min(), final_preds.min())
         max_age = max(final_targets.max(), final_preds.max())
-        if final_preds.min() < 0:
-            logger.warning("Visualization includes negative predictions (min=%.4f).", float(final_preds.min()))
         axes[1, 1].plot([min_age, max_age], [min_age, max_age], linewidth=2)
         try:
             axes[1, 1].text(
@@ -168,7 +166,7 @@ def save_subject_examples_report(run_output_dir, run_tag, subject_report_save_na
 
 
 def save_model_comparison_report(run_output_dir, run_tag, cnn_summary, mil_summary):
-    """Save a side-by-side metric comparison chart for CNN vs MIL.
+    """Save a metric comparison chart for Baseline vs CNN vs MIL.
 
     Args:
         run_output_dir (str): Output directory for comparison artifacts.
@@ -179,42 +177,59 @@ def save_model_comparison_report(run_output_dir, run_tag, cnn_summary, mil_summa
     Returns:
         str: Saved comparison figure path.
     """
+    # Use the baseline metrics stored in the per-run summary (baseline is the
+    # constant train-mean age predictor). Baseline should be identical for CNN
+    # and MIL runs given the same split; we take it from the CNN summary.
+    baseline = {
+        "test_loss": float(cnn_summary.get("baseline_loss", np.nan)),
+        "test_mae": float(cnn_summary.get("baseline_mae", np.nan)),
+        "test_r2": float(cnn_summary.get("baseline_r2", np.nan)),
+    }
+
     metrics = [
+        ("Test Loss (MSE)", "test_loss", False),
         ("Test MAE", "test_mae", False),
-        ("Test R2", "test_r2", True),
-        ("Subject MAE", "subject_mae", False),
-        ("Subject R2", "subject_r2", True),
+        ("Test R²", "test_r2", True),
     ]
 
+    baseline_values = [float(baseline.get(key, np.nan)) for _, key, _ in metrics]
     cnn_values = [float(cnn_summary.get(key, np.nan)) for _, key, _ in metrics]
     mil_values = [float(mil_summary.get(key, np.nan)) for _, key, _ in metrics]
     labels = [name for name, _, _ in metrics]
 
     x = np.arange(len(metrics), dtype=np.float32)
-    width = 0.35
+    width = 0.25
 
     fig, ax = plt.subplots(figsize=(12, 6))
-    ax.bar(x - width / 2, cnn_values, width, label="CNN", color="#4E79A7")
-    ax.bar(x + width / 2, mil_values, width, label="MIL", color="#F28E2B")
+    ax.bar(x - width, baseline_values, width, label="Baseline", color="#BAB0AC")
+    ax.bar(x, cnn_values, width, label="CNN", color="#4E79A7")
+    ax.bar(x + width, mil_values, width, label="CNN + MIL", color="#F28E2B")
 
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=0)
     ax.set_ylabel("Metric Value")
-    ax.set_title("CNN vs MIL Metric Comparison")
+    ax.set_title("Baseline vs CNN vs CNN+MIL (Test Metrics)")
     ax.grid(True, axis="y", alpha=0.3)
     ax.legend(loc="best")
 
     summary_lines = []
     for label, key, higher_is_better in metrics:
+        b_v = float(baseline.get(key, np.nan))
         cnn_v = float(cnn_summary.get(key, np.nan))
         mil_v = float(mil_summary.get(key, np.nan))
-        delta = mil_v - cnn_v
-        if np.isfinite(delta):
-            if higher_is_better:
-                verdict = "MIL better" if delta > 0 else ("CNN better" if delta < 0 else "Tie")
-            else:
-                verdict = "MIL better" if delta < 0 else ("CNN better" if delta > 0 else "Tie")
-            summary_lines.append(f"{label}: CNN={cnn_v:.4f} | MIL={mil_v:.4f} | delta={delta:+.4f} ({verdict})")
+        if not (np.isfinite(b_v) and np.isfinite(cnn_v) and np.isfinite(mil_v)):
+            continue
+        # Compare improvements over baseline for each model.
+        if higher_is_better:
+            cnn_gain = cnn_v - b_v
+            mil_gain = mil_v - b_v
+        else:
+            cnn_gain = b_v - cnn_v
+            mil_gain = b_v - mil_v
+        winner = "CNN+MIL" if mil_gain > cnn_gain else ("CNN" if cnn_gain > mil_gain else "Tie")
+        summary_lines.append(
+            f"{label}: baseline={b_v:.4f} | CNN={cnn_v:.4f} | CNN+MIL={mil_v:.4f} | better={winner}"
+        )
 
     if summary_lines:
         ax.text(

@@ -15,6 +15,7 @@ from cnn_age_project.data.dataset import (
     sample_epoch_subject_pseudo_bags,
 )
 from cnn_age_project.evaluation.evaluation import run_epoch_metrics
+from cnn_age_project.utils.age_predictions import clip_predicted_ages_in_years
 from cnn_age_project.models.cnn_model import EEGCNN
 from cnn_age_project.models.mil import MILAgeRegressor, MILInstanceEncoder, summarize_parameter_counts
 from cnn_age_project.training.losses import get_loss_function
@@ -44,31 +45,23 @@ def prepare_mil_instance_encoder(
         MILInstanceEncoder: MIL-ready instance encoder module.
     """
     logger.info(
-        "Preparing MIL instance encoder (Step 1) | freeze_encoder=%s | has_pretrained_weights=%s",
+        "MIL encoder: freeze=%s pretrained=%s",
         freeze_encoder,
         base_cnn_state_dict is not None,
     )
-
     base_cnn = EEGCNN(window_len, embedding_dim=cnn_embedding_dim, dropout=cnn_dropout)
     if base_cnn_state_dict is not None:
         missing, unexpected = base_cnn.load_state_dict(base_cnn_state_dict, strict=False)
-        logger.info(
-            "Loaded base CNN state dict for MIL encoder | missing_keys=%d | unexpected_keys=%d",
-            len(missing),
-            len(unexpected),
-        )
         if missing:
-            logger.warning("Missing CNN keys while loading for MIL encoder: %s", missing)
+            logger.debug("MIL encoder load missing keys: %s", missing)
         if unexpected:
-            logger.warning("Unexpected CNN keys while loading for MIL encoder: %s", unexpected)
-
+            logger.debug("MIL encoder load unexpected keys: %s", unexpected)
     encoder = MILInstanceEncoder.from_eegcnn(base_cnn, freeze_encoder=freeze_encoder).to(device)
     total_params, trainable_params = summarize_parameter_counts(encoder)
     logger.info(
-        "MIL Step 1 complete | encoder_params=%d | trainable_params=%d | frozen=%s",
+        "MIL encoder ready | params=%d trainable=%d",
         total_params,
         trainable_params,
-        freeze_encoder,
     )
     return encoder
 
@@ -146,7 +139,7 @@ def sample_mil_epoch_pseudo_bags(
     rng,
     pseudo_bag_min_windows=256,
     pseudo_bag_max_windows=500,
-    allow_replacement_when_small=True,
+    allow_replacement_when_small=False,
     sampling_strategy="random",
 ):
     """Sample one random pseudo-bag per subject for MIL epoch training.
@@ -158,8 +151,8 @@ def sample_mil_epoch_pseudo_bags(
         rng (np.random.Generator): Random generator for reproducible sampling.
         pseudo_bag_min_windows (int): Lower bound for sampled bag size.
         pseudo_bag_max_windows (int): Upper bound for sampled bag size.
-        allow_replacement_when_small (bool): Whether to sample with replacement
-            when a subject has fewer windows than requested bag size.
+        allow_replacement_when_small (bool): If True, upsample small subjects with
+            replacement; if False, use all unique windows (bag may be shorter).
         sampling_strategy (str): ``random`` or ``sequential`` bag sampling.
 
     Returns:
@@ -216,7 +209,7 @@ def build_mil_pseudo_bag_batch_iterator(
     """
     n_bags = len(pseudo_bags)
     n_batches = (n_bags + batch_size - 1) // max(1, batch_size)
-    logger.info("Building MIL pseudo-bag iterator | n_bags=%d | batch_size=%d | n_batches=%d", n_bags, batch_size, n_batches)
+    logger.debug("MIL pseudo-bags: n_bags=%d batch_size=%d n_batches=%d", n_bags, batch_size, n_batches)
     return iter_subject_pseudo_bag_batches(
         x_mem=x_mem,
         y_mem=y_mem,
@@ -317,6 +310,8 @@ def run_mil_finetune_training(
     early_stopping_min_delta_abs=1e-4,
     early_stopping_min_delta_rel=1e-3,
     grad_clip_norm=0.0,
+    encoder_warmup_epochs: int = 0,
+    encoder_learning_rate: float | None = None,
 ):
     """Run Step 3 full-model fine-tuning over stochastic pseudo-bags.
 
@@ -364,6 +359,10 @@ def run_mil_finetune_training(
     best_state_dict = None
     epochs_without_improvement = 0
 
+    # Cache original encoder learning rate (if provided) so we can
+    # restore it after the warmup "frozen" phase.
+    encoder_group_lr = float(encoder_learning_rate) if encoder_learning_rate is not None else None
+
     for epoch in range(epochs):
         mil_model.train()
 
@@ -405,6 +404,17 @@ def run_mil_finetune_training(
         metric_sum_y2 = 0.0
         metric_n = 0
 
+        # During warmup epochs, freeze encoder updates by setting the
+        # encoder parameter group's learning rate to zero. After warmup
+        # is finished, restore the configured encoder learning rate.
+        if encoder_group_lr is not None and encoder_warmup_epochs > 0:
+            # By convention, the first param group corresponds to encoder
+            # params when configured via `configure_mil_finetune_optimizer`.
+            if epoch < encoder_warmup_epochs:
+                optimizer.param_groups[0]["lr"] = 0.0
+            else:
+                optimizer.param_groups[0]["lr"] = encoder_group_lr
+
         for batch_num, (x_bags, y_bags, _, bag_mask) in enumerate(pbar, start=1):
             x_bags = x_bags.to(device, non_blocking=True)
             y_bags = y_bags.to(device, non_blocking=True)
@@ -428,6 +438,7 @@ def run_mil_finetune_training(
             scaler.update()
 
             outputs_year = outputs * y_std + y_mean if normalize_target else outputs
+            outputs_year = clip_predicted_ages_in_years(outputs_year)
             loss_year = torch.mean((outputs_year - y_bags) ** 2)
             running_loss += float(loss_year.item())
 
@@ -441,17 +452,7 @@ def run_mil_finetune_training(
             metric_sum_y2 += float(np.square(targets_np).sum())
             metric_n += targets_np.shape[0]
 
-            if (batch_num % debug_chunk_log_every) == 0:
-                logger.debug(
-                    "MIL fine-tune epoch %d batch %d/%d | running_loss=%.4f running_mae=%.4f",
-                    epoch + 1,
-                    batch_num,
-                    n_batches,
-                    running_loss / max(1, batch_num),
-                    metric_abs_error / max(1, metric_n),
-                )
-
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
+            pbar.set_postfix(loss=f"{loss.item():.4f}", mae=f"{metric_abs_error / max(1, metric_n):.4f}")
 
         avg_loss = running_loss / max(1, n_batches)
         mae = metric_abs_error / max(1, metric_n)
@@ -464,8 +465,9 @@ def run_mil_finetune_training(
         r2_scores.append(r2)
 
         logger.info(
-            "MIL fine-tune epoch %d | loss=%.4f | mae=%.3f | r2=%.4f",
+            "MIL epoch %d/%d | loss=%.4f mae=%.3f r2=%.4f",
             epoch + 1,
+            epochs,
             avg_loss,
             mae,
             r2,
@@ -500,7 +502,7 @@ def run_mil_finetune_training(
 
     if best_state_dict is not None:
         mil_model.load_state_dict(best_state_dict)
-        logger.info("MIL fine-tune restored best model weights from epoch %d.", best_epoch)
+        logger.info("MIL restored best weights (epoch %d).", best_epoch)
 
     return {
         "model": mil_model,
@@ -589,6 +591,7 @@ def evaluate_mil_on_subject_bags(
             loss = criterion(outputs, y_model)
 
             outputs_year = outputs * y_std + y_mean if normalize_target else outputs
+            outputs_year = clip_predicted_ages_in_years(outputs_year)
             mse_year = torch.mean((outputs_year - y_bags) ** 2)
             running_loss += float(mse_year.item())
 
@@ -769,7 +772,9 @@ def run_tuning_trial(
         dict[str, float | dict]: Trial metrics and hyperparameters.
     """
     trial_start = perf_counter()
-    logger.info("[Tune %d/%d] Starting trial with hparams=%s", trial_idx, total_trials, hparams)
+    logger.info("Tune trial %d/%d | lr=%.0e dropout=%.2f emb=%d", trial_idx, total_trials,
+                float(hparams.get("learning_rate", 3e-4)), float(hparams.get("cnn_dropout", 0)),
+                int(hparams.get("cnn_embedding_dim", 128)))
 
     model = EEGCNN(
         window_len,
@@ -854,18 +859,6 @@ def run_tuning_trial(
             scaler.update()
 
             running_train_loss += float(loss.item())
-            if (batch_num % debug_chunk_log_every) == 0:
-                logger.debug(
-                    "[Tune %d/%d] epoch %d/%d batch %d/%d | train_loss=%.4f",
-                    trial_idx,
-                    total_trials,
-                    epoch_idx + 1,
-                    tune_epochs,
-                    batch_num,
-                    n_batches,
-                    running_train_loss / batch_num,
-                )
-
             batch_bar.set_postfix(loss=f"{loss.item():.4f}")
 
         epoch_bar.set_postfix(avg_loss=f"{(running_train_loss / max(1, n_batches)):.4f}")
@@ -912,25 +905,12 @@ def run_tuning_trial(
             normalize_target=normalize_target,
             plot_max_points=0,
             debug_chunk_log_every=debug_chunk_log_every,
+            eval_label="Val Eval",
         )
         selection_mae = float(val_mae)
-        logger.info(
-            "[Tune %d/%d] Completed | val_mae=%.3f (selection) | test_mae=%.3f test_r2=%.4f",
-            trial_idx,
-            total_trials,
-            selection_mae,
-            test_mae,
-            test_r2,
-        )
+        logger.info("Tune %d/%d done | val_mae=%.3f (selection) test_mae=%.3f", trial_idx, total_trials, selection_mae, test_mae)
     else:
-        logger.info(
-            "[Tune %d/%d] Completed in %.1fs | test_mae=%.3f test_r2=%.4f",
-            trial_idx,
-            total_trials,
-            perf_counter() - trial_start,
-            test_mae,
-            test_r2,
-        )
+        logger.info("Tune %d/%d done | test_mae=%.3f (%.1fs)", trial_idx, total_trials, test_mae, perf_counter() - trial_start)
 
     trial_seconds = perf_counter() - trial_start
     out = {
@@ -1037,10 +1017,10 @@ def train_model(
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="min", factor=reduce_lr_factor, patience=reduce_lr_patience, min_lr=min_lr
         )
-        logger.info("LR scheduler: ReduceLROnPlateau (patience=%d, factor=%.2f)", reduce_lr_patience, reduce_lr_factor)
+        logger.debug("LR scheduler: plateau patience=%d factor=%.2f", reduce_lr_patience, reduce_lr_factor)
     elif lr_scheduler_type == "cosine":
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=min_lr)
-        logger.info("LR scheduler: CosineAnnealingLR (eta_min=%.0e)", min_lr)
+        logger.debug("LR scheduler: cosine eta_min=%.0e", min_lr)
 
     use_val_for_monitor = val_indices is not None and val_indices.size > 0
 
@@ -1107,6 +1087,7 @@ def train_model(
                 outputs_year = outputs * y_std + y_mean
             else:
                 outputs_year = outputs
+            outputs_year = clip_predicted_ages_in_years(outputs_year)
 
             loss_year = torch.mean((outputs_year - y_batch) ** 2)
             running_loss += float(loss_year.item())
@@ -1126,17 +1107,7 @@ def train_model(
                 epoch_targets_plot.append(targets_np[sample_idx])
                 epoch_preds_plot.append(outputs_np[sample_idx])
 
-            if (batch_num % debug_chunk_log_every) == 0:
-                logger.debug(
-                    "Train epoch %d batch %d/%d | running_loss=%.4f running_mae=%.4f",
-                    epoch + 1,
-                    batch_num,
-                    n_batches,
-                    running_loss / batch_num,
-                    metric_abs_error / max(1, metric_n),
-                )
-
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
+            pbar.set_postfix(loss=f"{loss.item():.4f}", mae=f"{metric_abs_error / max(1, metric_n):.4f}")
 
         avg_loss = running_loss / n_batches
         train_losses.append(avg_loss)
@@ -1177,20 +1148,20 @@ def train_model(
                 normalize_target=normalize_target,
                 plot_max_points=0,
                 debug_chunk_log_every=debug_chunk_log_every,
+                eval_label="Val Eval",
             )
             val_loss = val_result[0]
             val_mae = val_result[2]
             logger.info(
-                "Epoch %d | Train Loss: %.4f | Val Loss: %.4f | Val MAE: %.2f | R2: %.4f | MAE: %.2f",
+                "Epoch %d/%d | train_loss=%.4f val_loss=%.4f val_mae=%.2f",
                 epoch + 1,
+                epochs,
                 avg_loss,
                 val_loss,
                 val_mae,
-                r2,
-                mae,
             )
         else:
-            logger.info("Epoch %d | Loss: %.4f | R2: %.4f | MAE: %.2f", epoch + 1, avg_loss, r2, mae)
+            logger.info("Epoch %d/%d | loss=%.4f mae=%.2f", epoch + 1, epochs, avg_loss, mae)
 
         if len(epoch_targets_plot) > 0 and len(epoch_preds_plot) > 0:
             final_targets_plot = epoch_targets_plot
@@ -1222,17 +1193,12 @@ def train_model(
             and (epoch + 1) >= early_stopping_min_epochs
             and epochs_without_improvement >= early_stopping_patience
         ):
-            logger.info(
-                "Early stopping triggered at epoch %d (best epoch: %d, best loss: %.4f).",
-                epoch + 1,
-                best_epoch,
-                best_loss,
-            )
+            logger.info("Early stopping at epoch %d (best: epoch %d).", epoch + 1, best_epoch)
             break
 
     if best_state_dict is not None:
         model.load_state_dict(best_state_dict)
-        logger.info("Restored best model weights from epoch %d.", best_epoch)
+        logger.info("Restored best weights (epoch %d).", best_epoch)
 
     return {
         "model": model,

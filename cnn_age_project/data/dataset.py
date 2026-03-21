@@ -97,7 +97,7 @@ def sample_subject_pseudo_bag_indices(
     rng,
     min_windows=256,
     max_windows=500,
-    allow_replacement_when_small=True,
+    allow_replacement_when_small=False,
     sampling_strategy="random",
 ):
     """Sample one stochastic pseudo-bag for a specific subject.
@@ -111,7 +111,8 @@ def sample_subject_pseudo_bag_indices(
         min_windows (int): Minimum sampled bag size.
         max_windows (int): Maximum sampled bag size.
         allow_replacement_when_small (bool): If True and subject has fewer than
-            sampled bag size windows, sample with replacement.
+            sampled bag size windows, sample with replacement; if False, return
+            all windows (shorter bag, no duplicates).
 
     Returns:
         np.ndarray: Global indices for sampled pseudo-bag.
@@ -138,6 +139,7 @@ def sample_subject_pseudo_bag_indices(
         if strategy == "sequential":
             start_idx = int(rng.integers(0, n_items - target_bag_size + 1))
             return np.asarray(subject_indices[start_idx : start_idx + target_bag_size], dtype=np.int64)
+        # Random: sample distinct windows only (no replacement).
         rel = rng.choice(n_items, size=target_bag_size, replace=False)
         return np.asarray(subject_indices[rel], dtype=np.int64)
 
@@ -159,7 +161,7 @@ def sample_epoch_subject_pseudo_bags(
     rng,
     min_windows=256,
     max_windows=500,
-    allow_replacement_when_small=True,
+    allow_replacement_when_small=False,
     sampling_strategy="random",
 ):
     """Sample one stochastic pseudo-bag per subject for an epoch.
@@ -172,7 +174,7 @@ def sample_epoch_subject_pseudo_bags(
         min_windows (int): Minimum sampled bag size.
         max_windows (int): Maximum sampled bag size.
         allow_replacement_when_small (bool): If True, small-subject bags are
-            upsampled with replacement to the sampled bag size.
+            upsampled with replacement; if False, bags use unique windows only.
 
     Returns:
         list[tuple[int, np.ndarray]]: ``[(subject_code, bag_indices), ...]``.

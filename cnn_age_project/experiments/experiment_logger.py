@@ -51,7 +51,7 @@ def get_default_hyperparameters(
     mil_weight_decay=1e-2,
     mil_regressor_hidden_dim=64,
     mil_regressor_dropout=0.1,
-    mil_allow_replacement_when_small=True,
+    mil_allow_replacement_when_small=False,
 ):
     """Return baseline hyperparameters used when no tuned config exists.
 
@@ -97,7 +97,7 @@ def load_best_hyperparameters_if_available(path, defaults):
         dict[str, Any]: Loaded/merged hyperparameters.
     """
     if not os.path.exists(path):
-        logger.info("No saved hyperparameter file found. Using defaults.")
+        logger.info("No saved hyperparameter file found at: %s | Using defaults.", path)
         return defaults.copy()
 
     try:
@@ -388,6 +388,12 @@ def save_model_comparison_summary(data_dir, run_tag, cnn_summary, mil_summary):
     Returns:
         tuple[str, str, dict[str, Any]]: ``(txt_path, json_path, payload)``.
     """
+    baseline = {
+        "baseline_pred_age": float(cnn_summary.get("baseline_pred_age", np.nan)),
+        "baseline_loss": float(cnn_summary.get("baseline_loss", np.nan)),
+        "baseline_r2": float(cnn_summary.get("baseline_r2", np.nan)),
+        "baseline_mae": float(cnn_summary.get("baseline_mae", np.nan)),
+    }
     metrics = [
         ("test_mae", False),
         ("test_r2", True),
@@ -409,6 +415,7 @@ def save_model_comparison_summary(data_dir, run_tag, cnn_summary, mil_summary):
 
     payload = {
         "run_timestamp": run_tag,
+        "baseline": _to_serializable(baseline),
         "cnn": _to_serializable(cnn_summary),
         "mil": _to_serializable(mil_summary),
         "deltas": _to_serializable(deltas),
@@ -426,6 +433,20 @@ def save_model_comparison_summary(data_dir, run_tag, cnn_summary, mil_summary):
         f"Run Tag: {run_tag}",
         "",
     ]
+
+    # Baseline (constant train-mean age) reference for the shared split.
+    if any(np.isfinite(v) for v in baseline.values()):
+        lines.extend(
+            [
+                "Baseline (constant train-mean age)",
+                "-" * 80,
+                f"baseline_pred_age: {baseline.get('baseline_pred_age', 'n/a')}",
+                f"baseline_loss: {baseline.get('baseline_loss', 'n/a')}",
+                f"baseline_r2: {baseline.get('baseline_r2', 'n/a')}",
+                f"baseline_mae: {baseline.get('baseline_mae', 'n/a')}",
+                "",
+            ]
+        )
 
     for metric_name, higher_is_better in metrics:
         cnn_value = deltas[metric_name]["cnn"]

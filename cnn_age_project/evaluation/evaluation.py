@@ -5,6 +5,8 @@ import numpy as np
 import torch
 
 from cnn_age_project.data.dataset import iter_memmap_batches
+from cnn_age_project.models.mil import MILAgeRegressor
+from cnn_age_project.utils.age_predictions import clip_predicted_ages_in_years
 from cnn_age_project.utils.utils import make_tqdm
 
 logger = logging.getLogger(__name__)
@@ -28,6 +30,7 @@ def run_epoch_metrics(
     normalize_target=True,
     plot_max_points=100_000,
     debug_chunk_log_every=10,
+    eval_label="Test Eval",
 ):
     """Evaluate model over indices and return window-level plus optional subject aggregates.
 
@@ -49,6 +52,7 @@ def run_epoch_metrics(
         normalize_target (bool): Whether targets are normalized in-model.
         plot_max_points (int): Max sampled points for scatter plotting.
         debug_chunk_log_every (int): Debug logging cadence.
+        eval_label (str): Label for progress bar and logs (e.g. "Val Eval" during training, "Test Eval" for final evaluation).
 
     Returns:
         tuple: ``(avg_loss, r2, mae, eval_targets, eval_preds, sum_true_by_subject, sum_pred_by_subject, count_by_subject)``.
@@ -57,7 +61,7 @@ def run_epoch_metrics(
     n_eval = indices.shape[0]
     n_batches = (n_eval + batch_size - 1) // batch_size
 
-    logger.info("Starting evaluation over %d windows (%d batches).", n_eval, n_batches)
+    logger.info("%s: %d windows, %d batches", eval_label, n_eval, n_batches)
 
     running_loss = 0.0
     metric_abs_error = 0.0
@@ -65,9 +69,6 @@ def run_epoch_metrics(
     metric_sum_y = 0.0
     metric_sum_y2 = 0.0
     metric_n = 0
-    pred_min = np.inf
-    pred_max = -np.inf
-    pred_negative_count = 0
 
     sampled_targets = []
     sampled_preds = []
@@ -80,13 +81,13 @@ def run_epoch_metrics(
         sum_true_by_subject = np.zeros(n_subjects, dtype=np.float64)
         sum_pred_by_subject = np.zeros(n_subjects, dtype=np.float64)
         count_by_subject = np.zeros(n_subjects, dtype=np.int64)
-        logger.info("Subject-level aggregation enabled for %d subjects.", n_subjects)
+        logger.debug("Subject-level aggregation for %d subjects.", n_subjects)
 
     with torch.no_grad():
         pbar = make_tqdm(
             iter_memmap_batches(x_mem, y_mem, indices, batch_size, x_mean=x_mean, x_std=x_std),
             total=n_batches,
-            desc="Test Eval",
+            desc=eval_label,
             unit="batch",
             position=0,
             leave=True,
@@ -108,6 +109,7 @@ def run_epoch_metrics(
                 outputs_year = outputs * y_std + y_mean
             else:
                 outputs_year = outputs
+            outputs_year = clip_predicted_ages_in_years(outputs_year)
             loss_year = torch.mean((outputs_year - y_batch) ** 2)
             running_loss += float(loss_year.item())
 
@@ -120,9 +122,6 @@ def run_epoch_metrics(
             metric_sum_y += float(targets_np.sum())
             metric_sum_y2 += float(np.square(targets_np).sum())
             metric_n += targets_np.shape[0]
-            pred_min = min(pred_min, float(outputs_np.min()))
-            pred_max = max(pred_max, float(outputs_np.max()))
-            pred_negative_count += int((outputs_np < 0).sum())
 
             sample_idx = np.arange(0, targets_np.shape[0], max(1, targets_np.shape[0] // points_per_batch))[:points_per_batch]
             sampled_targets.append(targets_np[sample_idx])
@@ -143,34 +142,13 @@ def run_epoch_metrics(
                     sum_true_by_subject += np.bincount(valid_codes, weights=valid_targets, minlength=n_subjects)
                     sum_pred_by_subject += np.bincount(valid_codes, weights=valid_outputs, minlength=n_subjects)
 
-            if (batch_num % debug_chunk_log_every) == 0:
-                logger.debug(
-                    "Eval batch %d/%d | running_loss=%.4f | running_MAE=%.4f",
-                    batch_num,
-                    n_batches,
-                    running_loss / batch_num,
-                    metric_abs_error / max(1, metric_n),
-                )
-
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
+            pbar.set_postfix(loss=f"{loss.item():.4f}", mae=f"{metric_abs_error / max(1, metric_n):.4f}")
 
     avg_loss = running_loss / max(1, n_batches)
     mae = metric_abs_error / max(1, metric_n)
     y_mean_batch = metric_sum_y / max(1, metric_n)
     sst = metric_sum_y2 - (metric_n * y_mean_batch * y_mean_batch)
     r2 = (1.0 - (metric_sse / sst)) if sst > 0 else np.nan
-
-    if metric_n > 0:
-        pred_negative_pct = 100.0 * pred_negative_count / metric_n
-        logger.info(
-            "Eval prediction range | min=%.4f max=%.4f | negatives=%d (%.3f%%)",
-            pred_min,
-            pred_max,
-            pred_negative_count,
-            pred_negative_pct,
-        )
-        if pred_negative_count > 0:
-            logger.warning("Negative age predictions detected during eval.")
 
     eval_targets = np.concatenate(sampled_targets) if len(sampled_targets) > 0 else np.array([])
     eval_preds = np.concatenate(sampled_preds) if len(sampled_preds) > 0 else np.array([])
@@ -195,7 +173,7 @@ def compute_constant_baseline(y_mem, train_indices, test_indices, debug_chunk_lo
 
     n_train_chunks = (train_indices.shape[0] + chunk_size - 1) // chunk_size
     for chunk_idx, start in enumerate(
-        make_tqdm(range(0, train_indices.shape[0], chunk_size), desc="Baseline Train Mean", unit="chunk", position=0, leave=True),
+        make_tqdm(range(0, train_indices.shape[0], chunk_size), desc="Baseline train", unit="chunk", position=0, leave=True),
         start=1,
     ):
         end = min(start + chunk_size, train_indices.shape[0])
@@ -203,8 +181,6 @@ def compute_constant_baseline(y_mem, train_indices, test_indices, debug_chunk_lo
         chunk_y = np.asarray(y_mem[chunk_indices], dtype=np.float32)
         train_sum += float(chunk_y.sum())
         train_count += int(chunk_y.shape[0])
-        if (chunk_idx % debug_chunk_log_every) == 0:
-            logger.debug("Baseline train chunk %d/%d processed.", chunk_idx, n_train_chunks)
 
     baseline_pred = train_sum / max(1, train_count)
 
@@ -216,7 +192,7 @@ def compute_constant_baseline(y_mem, train_indices, test_indices, debug_chunk_lo
 
     n_test_chunks = (test_indices.shape[0] + chunk_size - 1) // chunk_size
     for chunk_idx, start in enumerate(
-        make_tqdm(range(0, test_indices.shape[0], chunk_size), desc="Baseline Test Eval", unit="chunk", position=0, leave=True),
+        make_tqdm(range(0, test_indices.shape[0], chunk_size), desc="Baseline test", unit="chunk", position=0, leave=True),
         start=1,
     ):
         end = min(start + chunk_size, test_indices.shape[0])
@@ -228,8 +204,6 @@ def compute_constant_baseline(y_mem, train_indices, test_indices, debug_chunk_lo
         test_sum_y += float(chunk_y.sum())
         test_sum_y2 += float(np.square(chunk_y).sum())
         test_count += int(chunk_y.shape[0])
-        if (chunk_idx % debug_chunk_log_every) == 0:
-            logger.debug("Baseline test chunk %d/%d processed.", chunk_idx, n_test_chunks)
 
     baseline_mae = test_abs_error / max(1, test_count)
     baseline_loss = test_sse / max(1, test_count)
@@ -283,6 +257,7 @@ def predict_for_indices(
                 outputs = model(x_batch)
             if normalize_target:
                 outputs = outputs * y_std + y_mean
+            outputs = clip_predicted_ages_in_years(outputs)
             preds.append(outputs.detach().float().cpu().numpy())
     return np.concatenate(preds) if len(preds) > 0 else np.array([])
 
@@ -429,19 +404,35 @@ def build_subject_examples(
         sample_positions = np.linspace(0, subject_window_indices.size - 1, num=sample_count, dtype=np.int64)
         sampled_indices = subject_window_indices[sample_positions]
 
-        preds = predict_for_indices(
-            model=model,
-            x_mem=x_mem,
-            indices=sampled_indices,
-            batch_size=batch_size,
-            device=device,
-            amp_enabled=amp_enabled,
-            x_mean=x_mean,
-            x_std=x_std,
-            y_mean=y_mean,
-            y_std=y_std,
-            normalize_target=normalize_target,
-        )
+        if isinstance(model, MILAgeRegressor):
+            # MIL path: build a single bag for this subject and run MIL model once.
+            bag_x = np.asarray(x_mem[sampled_indices], dtype=np.float32)
+            bag_x = (bag_x - x_mean) / x_std
+            # Shape: (1, n_instances, 1, window_len)
+            bag_tensor = torch.from_numpy(bag_x).unsqueeze(0).unsqueeze(2).to(device, non_blocking=True)
+            with torch.no_grad():
+                with torch.amp.autocast("cuda", enabled=amp_enabled):
+                    outputs = model(bag_tensor)
+            outputs = outputs.detach().float().cpu().numpy()
+            if normalize_target:
+                outputs = outputs * float(y_std) + float(y_mean)
+            preds = clip_predicted_ages_in_years(outputs.reshape(-1))
+        else:
+            # CNN path: window-wise predictions using helper.
+            preds = predict_for_indices(
+                model=model,
+                x_mem=x_mem,
+                indices=sampled_indices,
+                batch_size=batch_size,
+                device=device,
+                amp_enabled=amp_enabled,
+                x_mean=x_mean,
+                x_std=x_std,
+                y_mean=y_mean,
+                y_std=y_std,
+                normalize_target=normalize_target,
+            )
+
         if preds.size > 0:
             logger.debug(
                 "Subject example preds for %s | min=%.4f max=%.4f mean=%.4f",

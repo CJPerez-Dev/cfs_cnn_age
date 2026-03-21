@@ -20,13 +20,17 @@ class Config:
     subject_codebook_file: str = "subject_codebook_T1281.json"
 
     batch_size: int = 1024
-    epochs: int = 75
+    epochs: int = 50
     lr: float = 3e-4
 
     use_huber_loss: bool = True
     huber_beta: float = 1.0
 
     normalize_target: bool = True
+    # After denormalizing (or when targets are already in years), clamp predictions
+    # so reported ages are not below min_predicted_age_years (e.g. non-negative).
+    clip_predicted_age_after_denorm: bool = True
+    min_predicted_age_years: float = 0.0
     normalize_input: bool = True
     norm_sample_windows: int = 100_000
     norm_eps: float = 1e-6
@@ -47,9 +51,16 @@ class Config:
     mil_pseudo_bag_size: int = 256
     mil_pseudo_bag_min_windows: int = 256
     mil_pseudo_bag_max_windows: int = 256
-    mil_allow_replacement_when_small: bool = True
+    # When False, random bags use only unique windows (no upsampling); bags may
+    # be shorter than mil_bag_size for subjects with few windows.
+    mil_allow_replacement_when_small: bool = False
     mil_bag_batch_size: int = 16
     mil_finetune_encoder_lr: float = 1e-5
+    # Number of warmup epochs where the MIL encoder is effectively frozen
+    # (encoder parameter group learning rate set to 0). After this many
+    # epochs, the encoder learning rate is restored and full fine-tuning
+    # continues.
+    mil_finetune_encoder_warmup_epochs: int = 5
     mil_finetune_head_lr: float = 5e-5
     mil_finetune_weight_decay: float = 1e-2
 
@@ -61,8 +72,8 @@ class Config:
     bootstrap_confidence: float = 0.95
 
     early_stopping_enabled: bool = True
-    early_stopping_patience: int = 2
-    early_stopping_min_epochs: int = 3
+    early_stopping_patience: int = 6
+    early_stopping_min_epochs: int = 10
     early_stopping_min_delta_rel: float = 1e-3
     early_stopping_min_delta_abs: float = 1e-4
 
@@ -197,6 +208,8 @@ USE_HUBER_LOSS = CONFIG.use_huber_loss
 HUBER_BETA = CONFIG.huber_beta
 
 NORMALIZE_TARGET = CONFIG.normalize_target
+CLIP_PREDICTED_AGE_AFTER_DENORM = CONFIG.clip_predicted_age_after_denorm
+MIN_PREDICTED_AGE_YEARS = CONFIG.min_predicted_age_years
 NORMALIZE_INPUT = CONFIG.normalize_input
 NORM_SAMPLE_WINDOWS = CONFIG.norm_sample_windows
 NORM_EPS = CONFIG.norm_eps
@@ -222,6 +235,7 @@ MIL_BAG_BATCH_SIZE = CONFIG.mil_bag_batch_size
 MIL_FINETUNE_ENCODER_LR = CONFIG.mil_finetune_encoder_lr
 MIL_FINETUNE_HEAD_LR = CONFIG.mil_finetune_head_lr
 MIL_FINETUNE_WEIGHT_DECAY = CONFIG.mil_finetune_weight_decay
+MIL_FINETUNE_ENCODER_WARMUP_EPOCHS = CONFIG.mil_finetune_encoder_warmup_epochs
 
 LOG_LEVEL = CONFIG.log_level
 DEBUG_CHUNK_LOG_EVERY = CONFIG.debug_chunk_log_every

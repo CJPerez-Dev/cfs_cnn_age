@@ -13,6 +13,7 @@ from cnn_age_project.config import (
     AGE_TARGET_CACHE_FILE,
     BATCH_SIZE,
     BEST_HPARAMS_FILE,
+    CLIP_PREDICTED_AGE_AFTER_DENORM,
     BOOTSTRAP_CONFIDENCE,
     BOOTSTRAP_ENABLED,
     BOOTSTRAP_ITERATIONS,
@@ -30,12 +31,14 @@ from cnn_age_project.config import (
     MIL_ALLOW_REPLACEMENT_WHEN_SMALL,
     MIL_BAG_BATCH_SIZE,
     MIL_FINETUNE_ENCODER_LR,
+    MIL_FINETUNE_ENCODER_WARMUP_EPOCHS,
     MIL_FINETUNE_HEAD_LR,
     MIL_FINETUNE_WEIGHT_DECAY,
     MIL_PSEUDO_BAG_MAX_WINDOWS,
     MIL_PSEUDO_BAG_MIN_WINDOWS,
     MAX_WINDOWS_PER_SUBJECT_PER_EPOCH,
     METRIC_EVERY_N_EPOCHS,
+    MIN_PREDICTED_AGE_YEARS,
     MODEL_SAVE_NAME,
     NORM_EPS,
     NORMALIZE_INPUT,
@@ -274,22 +277,7 @@ def initialize_run_context():
     run_output_dir = os.path.join(OUTPUT_DIR, run_tag)
     os.makedirs(run_output_dir, exist_ok=True)
 
-    logging.info("==== EEG CNN Age Prediction Pipeline Started ====")
-    logging.info(
-        "Config | batch=%d epochs=%d lr=%.4g tf32=%s compile=%s huber=%s norm_x=%s norm_y=%s balanced=%s log_level=%s",
-        BATCH_SIZE,
-        EPOCHS,
-        LR,
-        USE_TF32,
-        USE_TORCH_COMPILE,
-        USE_HUBER_LOSS,
-        NORMALIZE_INPUT,
-        NORMALIZE_TARGET,
-        SUBJECT_BALANCED_TRAINING,
-        LOG_LEVEL,
-    )
-    logging.info("Project folders | input=%s | output=%s", INPUT_DIR, OUTPUT_DIR)
-    logging.info("Run artifact folder: %s", run_output_dir)
+    logging.info("Pipeline started | output=%s", run_output_dir)
 
     return RunContext(
         run_start_time=run_start_time,
@@ -312,7 +300,6 @@ def setup_runtime_context(args=None):
 
     log_stage("Preflight Checks", logger)
     memmap_root = validate_required_project_files(INPUT_DIR, OUTPUT_DIR, use_auto_split=use_auto_split)
-    logging.info("Memmap source directory: %s", memmap_root)
 
     log_stage("Device Setup", logger)
     device, gpu_name = select_device(USE_TF32, logger)
@@ -354,16 +341,12 @@ def load_data_context(runtime_ctx: RuntimeContext, args=None):
         DataContext: Loaded arrays, split indices, and subject metadata.
     """
     log_stage("Memmap Loading", logger)
-    logging.info("Opening memmap files (sequential streaming mode)...")
     memmaps = load_memmap_arrays(runtime_ctx.memmap_root)
     x_mem = memmaps["x_mem"]
     n_samples = memmaps["n_samples"]
     window_len = memmaps["window_len"]
     meta_path = memmaps["meta_path"]
-
-    logging.info("Detected samples: %d", n_samples)
-    logging.info("Detected window length: %d", window_len)
-    logging.info("Memmap tensors ready (contiguous streaming batches).")
+    logging.info("Samples: %d | window length: %d", n_samples, window_len)
 
     log_stage("Label + Split Preparation", logger)
     use_auto_split = getattr(args, "auto_split", USE_AUTO_SPLIT) if args is not None else USE_AUTO_SPLIT
@@ -376,11 +359,10 @@ def load_data_context(runtime_ctx: RuntimeContext, args=None):
             key_path = os.path.join(INPUT_DIR, "AgeKey.csv")
         if key_path and os.path.exists(key_path):
             subject_age = load_subject_age_map(key_path)
-            logger.info("Auto-split: loaded subject ages from %s | %d subjects", key_path, len(subject_age))
         if not subject_age:
             subject_age = build_subject_age_map_from_metadata(meta_path, n_samples)
-            if subject_age:
-                logger.info("Auto-split: using age column from metadata | %d subjects", len(subject_age))
+        if subject_age:
+            logger.debug("Subject ages: %d subjects", len(subject_age))
         if not subject_age:
             raise ValueError(
                 "use_auto_split is True but no subject ages found. "
@@ -399,15 +381,7 @@ def load_data_context(runtime_ctx: RuntimeContext, args=None):
         train_age_map = {s: subject_age[s] for s in train_ids}
         test_age_map = {s: subject_age[s] for s in test_ids}
         val_age_map = {s: subject_age[s] for s in val_ids}
-        logger.info(
-            "Auto-split (subject-level) | train: %d val: %d test: %d subjects (ratios %.2f/%.2f/%.2f)",
-            len(train_age_map),
-            len(val_age_map),
-            len(test_age_map),
-            SPLIT_RATIO_TRAIN,
-            SPLIT_RATIO_VAL,
-            SPLIT_RATIO_TEST,
-        )
+        logger.info("Split | train=%d val=%d test=%d subjects", len(train_age_map), len(val_age_map), len(test_age_map))
     else:
         if not os.path.exists(TRAIN_KEY_CSV) or not os.path.exists(TEST_KEY_CSV):
             raise FileNotFoundError("Training/testing key CSV files were not found in input folder.")
@@ -430,7 +404,7 @@ def load_data_context(runtime_ctx: RuntimeContext, args=None):
                     raise ValueError(
                         f"Validation subjects must not overlap with {name}: {len(overlap)} overlapping."
                     )
-            logger.info("Validation set loaded from %s | %d subjects", validation_csv_path, len(val_age_map))
+            logger.info("Validation set: %d subjects", len(val_age_map))
 
     split_codes, age_targets, subject_codes, subject_codebook = build_or_load_targets_and_split(
         meta_path=meta_path,
@@ -468,11 +442,12 @@ def load_data_context(runtime_ctx: RuntimeContext, args=None):
         val_indices=val_indices,
     )
 
-    log_msg = "Split windows with age labels | train: %d | test: %d" % (train_indices.size, test_indices.size)
-    if val_indices is not None:
-        log_msg += " | val: %d" % val_indices.size
-    logging.info(log_msg)
-    logger.info("Unique subjects discovered in metadata: %d", len(subject_codebook))
+    logging.info(
+        "Windows | train=%d test=%d%s",
+        train_indices.size,
+        test_indices.size,
+        f" val={val_indices.size}" if val_indices is not None and val_indices.size > 0 else "",
+    )
 
     return DataContext(
         x_mem=x_mem,
@@ -508,7 +483,7 @@ def setup_normalization_context(data_ctx: DataContext, rng):
     if y_std < 1e-6:
         logger.warning("Target std was extremely small (%.6g). Clipping to 1e-3 for stability.", y_std)
         y_std = 1e-3
-    logger.info("Target normalization | enabled=%s mean=%.4f std=%.4f", NORMALIZE_TARGET, y_mean, y_std)
+    logger.debug("Target norm: enabled=%s mean=%.4f std=%.4f", NORMALIZE_TARGET, y_mean, y_std)
 
     if NORMALIZE_INPUT:
         x_mean, x_std = estimate_input_norm_stats(
@@ -523,7 +498,7 @@ def setup_normalization_context(data_ctx: DataContext, rng):
     if x_std < 1e-6:
         logger.warning("Input std was extremely small (%.6g). Clipping to 1e-3 for stability.", x_std)
         x_std = 1e-3
-    logger.info("Input normalization | enabled=%s mean=%.6f std=%.6f", NORMALIZE_INPUT, x_mean, x_std)
+    logger.debug("Input norm: enabled=%s mean=%.6f std=%.6f", NORMALIZE_INPUT, x_mean, x_std)
 
     balanced_sorted_indices = None
     balanced_offsets = None
@@ -534,11 +509,7 @@ def setup_normalization_context(data_ctx: DataContext, rng):
             subject_codes=data_ctx.subject_codes,
             n_subjects=len(data_ctx.subject_codebook),
         )
-        logger.info(
-            "Subject-balanced training enabled | max windows/subject/epoch=%d | subjects with windows=%d",
-            MAX_WINDOWS_PER_SUBJECT_PER_EPOCH,
-            int(np.sum(balanced_counts > 0)),
-        )
+        logger.debug("Subject-balanced: max_windows/subject=%d subjects=%d", MAX_WINDOWS_PER_SUBJECT_PER_EPOCH, int(np.sum(balanced_counts > 0)))
 
     return NormalizationContext(
         x_mean=x_mean,
@@ -584,15 +555,28 @@ def _run_mil_tuning_trial(
 ):
     """Run one MIL hyperparameter tuning trial and return held-out metrics."""
     trial_start = perf_counter()
-    logger.info("[Tune %d/%d] Starting MIL trial with hparams=%s", trial_idx, total_trials, hparams)
+    logger.info("MIL tune trial %d/%d", trial_idx, total_trials)
+
+    # When a pretrained CNN checkpoint is provided, its architecture
+    # (embedding dimension) must match the CNN we instantiate for MIL.
+    # Infer the encoder embedding dimension from the checkpoint if
+    # available; otherwise fall back to candidate hparams/defaults.
+    if base_cnn_state_dict is not None:
+        # `features.8.bias` has shape [embedding_dim].
+        try:
+            embedding_dim = int(base_cnn_state_dict["features.8.bias"].shape[0])
+        except Exception:
+            embedding_dim = int(hparams.get("cnn_embedding_dim", 128))
+    else:
+        embedding_dim = int(hparams.get("cnn_embedding_dim", 128))
 
     mil_model = build_mil_gated_attention_model(
         window_len=data_ctx.window_len,
         device=runtime_ctx.device,
         freeze_encoder=True,
         base_cnn_state_dict=base_cnn_state_dict,
-        feature_dim=int(hparams.get("cnn_embedding_dim", 128)),
-        cnn_embedding_dim=int(hparams.get("cnn_embedding_dim", 128)),
+        feature_dim=embedding_dim,
+        cnn_embedding_dim=embedding_dim,
         cnn_dropout=float(hparams.get("cnn_dropout", 0.0)),
         attention_dim=int(hparams.get("mil_attention_dim", 128)),
         regressor_hidden_dim=int(hparams.get("mil_regressor_hidden_dim", 64)),
@@ -740,7 +724,15 @@ def select_hyperparameters(args, data_ctx: DataContext, norm_ctx: NormalizationC
     repo_hparams_path = os.path.join(PROJECT_DIR, "output", "hparams", BEST_HPARAMS_FILE)
     default_hparams_path = DEFAULT_HPARAMS_PATH
     if args.hparams_file:
-        best_hparams_path = args.hparams_file
+        # Accept absolute paths, repo-relative paths, and POSIX-style "/output/..." paths
+        # that commonly appear when copying commands across shells/OSes.
+        candidate = str(args.hparams_file)
+        if not os.path.exists(candidate):
+            candidate_rel = candidate.lstrip("/\\")
+            candidate2 = os.path.join(PROJECT_DIR, candidate_rel)
+            if os.path.exists(candidate2):
+                candidate = candidate2
+        best_hparams_path = candidate
 
     log_stage("Hyperparameter Selection", logger)
     if args.tune:
@@ -887,11 +879,9 @@ def select_hyperparameters(args, data_ctx: DataContext, norm_ctx: NormalizationC
             dest_path = os.path.join(hparams_dir, f"best_hyperparameters_{tag}.json")
         save_best_hyperparameters(dest_path, active_hparams, tuning_results=tuning_results)
         logger.info(
-            "Best tuning hyperparameters selected | selection_mae=%.3f test_mae=%.3f R2=%.4f hparams=%s | total_tune_time=%.1fs",
+            "Best tune | selection_mae=%.3f test_mae=%.3f (%.1fs)",
             _selection_mae(best_trial),
             best_trial["test_mae"],
-            best_trial["test_r2"],
-            active_hparams,
             perf_counter() - tuning_start,
         )
     else:
@@ -902,7 +892,7 @@ def select_hyperparameters(args, data_ctx: DataContext, norm_ctx: NormalizationC
             elif os.path.exists(repo_hparams_path):
                 best_hparams_path = repo_hparams_path
         active_hparams = load_best_hyperparameters_if_available(best_hparams_path, defaults)
-        logger.info("Active hyperparameters for training: %s", active_hparams)
+        logger.debug("Active hyperparameters: %s", active_hparams)
 
     return HyperparameterContext(
         active_hparams=active_hparams,
@@ -968,6 +958,24 @@ def run_training_stage(
         cnn_embedding_dim = int(
             _resolve_cli_or_hparam(args, "cnn_embedding_dim", active_hparams, "cnn_embedding_dim", 128)
         )
+        # If we're loading a pretrained CNN checkpoint, its embedding dimension
+        # must match the instantiated encoder architecture. Infer it from the
+        # checkpoint and override any hparam/CLI value to avoid size mismatches.
+        if base_cnn_state_dict is not None:
+            try:
+                inferred_dim = int(base_cnn_state_dict["features.8.bias"].shape[0])
+                if inferred_dim != cnn_embedding_dim:
+                    logger.info(
+                        "MIL encoder embedding dim overridden by checkpoint | hparams=%d checkpoint=%d",
+                        cnn_embedding_dim,
+                        inferred_dim,
+                    )
+                cnn_embedding_dim = inferred_dim
+            except Exception:
+                logger.warning(
+                    "Could not infer cnn_embedding_dim from checkpoint; using configured value: %d",
+                    cnn_embedding_dim,
+                )
         cnn_dropout = float(
             _resolve_cli_or_hparam(args, "cnn_dropout", active_hparams, "cnn_dropout", 0.0)
         )
@@ -1036,7 +1044,7 @@ def run_training_stage(
         mil_offsets = norm_ctx.balanced_offsets
         mil_counts = norm_ctx.balanced_counts
         if mil_sorted_indices is None or mil_offsets is None or mil_counts is None:
-            logger.info("Building subject group index for MIL fine-tuning (subject-balanced sampler dependency).")
+            logger.debug("Building MIL subject group index.")
             mil_sorted_indices, mil_offsets, mil_counts = build_subject_group_index(
                 train_indices=data_ctx.train_indices,
                 subject_codes=data_ctx.subject_codes,
@@ -1072,7 +1080,7 @@ def run_training_stage(
             balanced_counts=mil_counts,
             rng=rng,
             epochs=EPOCHS,
-            bag_batch_size=int(getattr(args, "mil_bag_batch_size", MIL_BAG_BATCH_SIZE)),
+            bag_batch_size=int(getattr(args, "mil_bag_batch_size", None) or MIL_BAG_BATCH_SIZE),
             x_mean=norm_ctx.x_mean,
             x_std=norm_ctx.x_std,
             y_mean=norm_ctx.y_mean,
@@ -1090,6 +1098,8 @@ def run_training_stage(
             early_stopping_min_delta_abs=MIL_EARLY_STOPPING_MIN_DELTA_ABS,
             early_stopping_min_delta_rel=MIL_EARLY_STOPPING_MIN_DELTA_REL,
             grad_clip_norm=GRAD_CLIP_NORM,
+            encoder_warmup_epochs=int(MIL_FINETUNE_ENCODER_WARMUP_EPOCHS),
+            encoder_learning_rate=float(active_hparams.get("mil_encoder_lr", MIL_FINETUNE_ENCODER_LR)),
         )
 
         return TrainingContext(
@@ -1184,6 +1194,7 @@ def run_evaluation_stage(
     data_ctx: DataContext,
     norm_ctx: NormalizationContext,
     train_ctx: TrainingContext,
+    hparam_ctx: HyperparameterContext | None,
     runtime_ctx: RuntimeContext,
     rng,
 ):
@@ -1200,8 +1211,25 @@ def run_evaluation_stage(
         EvaluationContext: Evaluation metrics, baseline metrics, and subject examples.
     """
     log_stage("Held-out Evaluation", logger)
-    logging.info("Running held-out test-set evaluation...")
+    logging.info("Test evaluation...")
     if isinstance(train_ctx.model, MILAgeRegressor):
+        active_hparams = hparam_ctx.active_hparams if hparam_ctx is not None else {}
+        # Keep MIL evaluation consistent with MIL tuning: use the tuned bag size
+        # and sampling strategy when available.
+        eval_bag_size = int(active_hparams.get("mil_bag_size", MIL_PSEUDO_BAG_MIN_WINDOWS))
+        eval_sampling_strategy = str(active_hparams.get("mil_sampling_strategy", "sequential"))
+        eval_allow_replacement = bool(
+            active_hparams.get(
+                "mil_allow_replacement_when_small",
+                MIL_ALLOW_REPLACEMENT_WHEN_SMALL,
+            )
+        )
+        logging.info(
+            "MIL eval bags | bag_size=%d sampling_strategy=%s allow_replacement_when_small=%s",
+            eval_bag_size,
+            eval_sampling_strategy,
+            eval_allow_replacement,
+        )
         mil_eval = evaluate_mil_on_subject_bags(
             mil_model=train_ctx.model,
             criterion=train_ctx.criterion,
@@ -1218,10 +1246,10 @@ def run_evaluation_stage(
             y_std=norm_ctx.y_std,
             normalize_target=NORMALIZE_TARGET,
             rng=rng,
-            pseudo_bag_min_windows=MIL_PSEUDO_BAG_MIN_WINDOWS,
-            pseudo_bag_max_windows=MIL_PSEUDO_BAG_MAX_WINDOWS,
-            allow_replacement_when_small=MIL_ALLOW_REPLACEMENT_WHEN_SMALL,
-            sampling_strategy="sequential",
+            pseudo_bag_min_windows=eval_bag_size,
+            pseudo_bag_max_windows=eval_bag_size,
+            allow_replacement_when_small=eval_allow_replacement,
+            sampling_strategy=eval_sampling_strategy,
         )
         test_loss = mil_eval["test_loss"]
         test_r2 = mil_eval["test_r2"]
@@ -1251,7 +1279,7 @@ def run_evaluation_stage(
             plot_max_points=PLOT_MAX_POINTS,
             debug_chunk_log_every=DEBUG_CHUNK_LOG_EVERY,
         )
-    logging.info("Test | Loss: %.4f | R2: %.4f | MAE: %.2f", test_loss, test_r2, test_mae)
+    logging.info("Test results | loss=%.4f R2=%.4f MAE=%.2f", test_loss, test_r2, test_mae)
 
     subj_mae = np.nan
     subj_r2 = np.nan
@@ -1330,7 +1358,7 @@ def run_evaluation_stage(
             subject_count=max(2, SUBJECT_EXAMPLE_COUNT),
             max_windows=SUBJECT_EXAMPLE_MAX_WINDOWS,
         )
-        logging.info("Prepared %d random subject examples for plotting.", len(subject_examples))
+        logger.debug("Subject examples for plot: %d", len(subject_examples))
     else:
         logging.warning("Subject example plot skipped: no subject codes available.")
 
@@ -1421,6 +1449,8 @@ def save_artifacts_and_summary(
         "huber_beta": hparam_ctx.active_huber_beta,
         "normalize_input": NORMALIZE_INPUT,
         "normalize_target": NORMALIZE_TARGET,
+        "clip_predicted_age_after_denorm": CLIP_PREDICTED_AGE_AFTER_DENORM,
+        "min_predicted_age_years": MIN_PREDICTED_AGE_YEARS,
         "subject_balanced_training": SUBJECT_BALANCED_TRAINING,
         "max_windows_per_subject_per_epoch": hparam_ctx.active_max_windows_per_subject,
         "tf32_enabled": USE_TF32,
@@ -1465,7 +1495,7 @@ def save_artifacts_and_summary(
     log_stage("Run Summary", logger)
     save_run_summary(run_ctx.run_output_dir, summary_payload, run_ctx.run_tag)
 
-    logging.info("==== Training Complete ====")
+    logging.info("Training complete.")
     return summary_payload
 
 
@@ -1507,6 +1537,21 @@ def _build_model_args(args, model_label):
     return model_args
 
 
+def _resolve_model_hparams_file(args, model_label: str) -> str | None:
+    """Resolve per-model hyperparameter file for `both` runs.
+
+    Precedence (per model):
+    - --cnn-hparams-file / --mil-hparams-file (when provided)
+    - --hparams-file (shared)
+    - defaults/default_hyperparameters.json (handled by select_hyperparameters)
+    """
+    if model_label == "cnn":
+        return getattr(args, "cnn_hparams_file", None) or getattr(args, "hparams_file", None)
+    if model_label == "mil":
+        return getattr(args, "mil_hparams_file", None) or getattr(args, "hparams_file", None)
+    return getattr(args, "hparams_file", None)
+
+
 def execute_full_workflow(args):
     """Execute all pipeline stages from setup through artifact generation.
 
@@ -1539,16 +1584,26 @@ def execute_full_workflow(args):
     if (getattr(args, "model_mode", None) == "both") and (not bool(getattr(args, "tune", False))):
         # When running both modes back-to-back we expect a hyperparameters JSON
         # to be provided either via `--hparams-file` or defaults/default_hyperparameters.json.
-        if not getattr(args, "hparams_file", None) and not os.path.exists(DEFAULT_HPARAMS_PATH):
+        has_any_cli_hparams = bool(
+            getattr(args, "hparams_file", None)
+            or getattr(args, "cnn_hparams_file", None)
+            or getattr(args, "mil_hparams_file", None)
+        )
+        if (not has_any_cli_hparams) and (not os.path.exists(DEFAULT_HPARAMS_PATH)):
             repo_hparams_path = os.path.join(PROJECT_DIR, "output", "hparams", BEST_HPARAMS_FILE)
             if not os.path.exists(repo_hparams_path):
                 raise FileNotFoundError(
                     "`both` mode requires a hyperparameters JSON file.\n"
-                    "Provide one with the CLI flag `--hparams-file PATH` or\n"
+                    "Provide one with the CLI flag `--hparams-file PATH` (shared) or\n"
+                    "provide per-model files with `--cnn-hparams-file PATH` and/or `--mil-hparams-file PATH`, or\n"
                     f"place a file named '{os.path.basename(DEFAULT_HPARAMS_PATH)}' in the repository 'defaults' folder: {os.path.dirname(DEFAULT_HPARAMS_PATH)}\n"
                     "Example: defaults/default_hyperparameters.json"
                 )
 
+    # Global hyperparameters context:
+    # - For single-mode runs this is the only context.
+    # - For `both` mode we still build it once so downstream summary keys are
+    #   consistent, but each model run may override it with per-model files.
     hparam_ctx = select_hyperparameters(args, data_ctx, norm_ctx, runtime_ctx, run_ctx=run_ctx)
 
     # Default behavior: when tuning is requested, stop after saving tuned
@@ -1566,6 +1621,13 @@ def execute_full_workflow(args):
 
     model_summaries = {}
 
+    if (getattr(args, "model_mode", None) == "both") and (not bool(getattr(args, "tune", False))):
+        logger.info(
+            "Both mode: per-model hparams | cnn=%s | mil=%s",
+            _resolve_model_hparams_file(args, "cnn") or "defaults",
+            _resolve_model_hparams_file(args, "mil") or "defaults",
+        )
+
     for model_label in model_labels:
         log_stage(f"Model Run: {model_label.upper()}", logger)
         model_output_dir = os.path.join(run_ctx.run_output_dir, model_label)
@@ -1578,14 +1640,21 @@ def execute_full_workflow(args):
             run_output_dir=model_output_dir,
         )
         model_args = _build_model_args(args, model_label)
+        # Allow separate tuned hyperparameter files per model in `both` mode.
+        # This enables a fair "best CNN" vs "best CNN+MIL" comparison.
+        if (getattr(args, "model_mode", None) == "both") and (not bool(getattr(args, "tune", False))):
+            model_args.hparams_file = _resolve_model_hparams_file(args, model_label)
+            model_hparam_ctx = select_hyperparameters(model_args, data_ctx, norm_ctx, runtime_ctx, run_ctx=run_ctx)
+        else:
+            model_hparam_ctx = hparam_ctx
 
-        train_ctx = run_training_stage(data_ctx, norm_ctx, hparam_ctx, runtime_ctx, run_ctx.rng, model_args)
-        eval_ctx = run_evaluation_stage(data_ctx, norm_ctx, train_ctx, runtime_ctx, run_ctx.rng)
+        train_ctx = run_training_stage(data_ctx, norm_ctx, model_hparam_ctx, runtime_ctx, run_ctx.rng, model_args)
+        eval_ctx = run_evaluation_stage(data_ctx, norm_ctx, train_ctx, model_hparam_ctx, runtime_ctx, run_ctx.rng)
         summary_payload = save_artifacts_and_summary(
             model_run_ctx,
             runtime_ctx,
             data_ctx,
-            hparam_ctx,
+            model_hparam_ctx,
             train_ctx,
             eval_ctx,
             model_label=model_label,

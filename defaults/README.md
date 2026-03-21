@@ -32,7 +32,7 @@ Supported default files (place these in the `defaults/` folder at the repo root)
   "mil_head_lr": 0.00005,
   "mil_weight_decay": 0.01,
   "mil_regressor_hidden_dim": 64,
-  "mil_allow_replacement_when_small": true
+  "mil_allow_replacement_when_small": false
 }
 ```
 
