@@ -12,6 +12,7 @@ from cnn_age_project.data.age_strata import build_mil_train_subject_inverse_freq
 from cnn_age_project.data.dataset import (
     iter_subject_pseudo_bag_batches,
     iter_memmap_batches,
+    resolve_cnn_age_weighted_epoch_num_samples,
     sample_balanced_train_indices,
     sample_epoch_subject_pseudo_bags,
     sample_subject_pseudo_bag_indices,
@@ -888,6 +889,7 @@ def run_tuning_trial(
     val_indices=None,
     train_window_sample_weights=None,
     use_age_weighted_window_sampling=False,
+    cnn_samples_per_epoch=None,
 ):
     """Train a short trial with candidate hyperparameters and return held-out metrics.
 
@@ -922,6 +924,7 @@ def run_tuning_trial(
         max_windows_per_subject_per_epoch (int): Sampling cap per subject.
         debug_chunk_log_every (int): Debug logging cadence.
         plot_max_points (int): Max plotted points for eval metric helper.
+        cnn_samples_per_epoch (int | None): Age-weighted draws per epoch; ``None``/``<=0`` = full train pool.
 
     Returns:
         dict[str, float | dict]: Trial metrics and hyperparameters.
@@ -965,10 +968,11 @@ def run_tuning_trial(
             and train_window_sample_weights is not None
             and train_window_sample_weights.shape[0] == train_indices.shape[0]
         ):
+            n_draw = resolve_cnn_age_weighted_epoch_num_samples(train_indices.shape[0], cnn_samples_per_epoch)
             epoch_train_indices = sample_weighted_train_epoch_indices(
                 train_indices,
                 train_window_sample_weights,
-                num_samples=int(train_indices.shape[0]),
+                num_samples=n_draw,
                 rng=rng,
                 replace=True,
             )
@@ -1133,6 +1137,7 @@ def train_model(
     grad_clip_norm=0.0,
     train_window_sample_weights=None,
     use_age_weighted_window_sampling=False,
+    cnn_samples_per_epoch=None,
 ):
     """Run full training loop with optional balanced sampling, validation, LR scheduler, and early stopping.
 
@@ -1167,6 +1172,7 @@ def train_model(
         early_stopping_min_delta_abs (float): Absolute improvement threshold.
         early_stopping_min_delta_rel (float): Relative improvement threshold.
         amp_enabled (bool): Whether AMP is enabled.
+        cnn_samples_per_epoch (int | None): Age-weighted stochastic draws per epoch; ``None``/``<=0`` = full pool.
 
     Returns:
         dict[str, Any]: Trained model plus loss/metric histories and best-epoch metadata.
@@ -1210,10 +1216,11 @@ def train_model(
             and train_window_sample_weights is not None
             and train_window_sample_weights.shape[0] == train_indices.shape[0]
         ):
+            n_draw = resolve_cnn_age_weighted_epoch_num_samples(train_indices.shape[0], cnn_samples_per_epoch)
             epoch_train_indices = sample_weighted_train_epoch_indices(
                 train_indices,
                 train_window_sample_weights,
-                num_samples=int(train_indices.shape[0]),
+                num_samples=n_draw,
                 rng=rng,
                 replace=True,
             )

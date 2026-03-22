@@ -83,7 +83,7 @@ cfs_cnn_age/
 ├─ input/                        # User-provided data
 ├─ output/                       # Generated artifacts
 │  └─ hparams/                   # Tuned hyperparameters
-├─ scripts/                      # Utilities (e.g. merge_key_files.py)
+├─ scripts/                      # Utilities (merge_key_files.py, report_train_stratum_window_counts.py, …)
 ├─ defaults/                     # Optional fallbacks (default_model.pt, default_hyperparameters.json)
 ├─ requirements-cpu.txt
 └─ requirements-gpu.txt
@@ -144,6 +144,8 @@ Install GPU dependencies:
 ```bash
 pip install -r requirements-gpu.txt
 ```
+
+**CURC Alpine (HPC):** do not use `requirements-gpu.txt` on the cluster — it targets **CUDA 13 (cu130)** while Alpine’s module stack is **CUDA 12.1**. Use a **Linux** venv there, install **`cu121`** PyTorch, then `pip install -r requirements-gpu-alpine.txt`. Full step-by-step: [`docs/ALPINE_SETUP.md`](docs/ALPINE_SETUP.md).
 
 Quick verification:
 
@@ -209,7 +211,7 @@ By default the pipeline uses **auto-split**: a 70/15/15 subject-level train/vali
 
 **Age stratification (default on):** subjects are assigned to age strata (one stratum for ages **below** `stratify_tail_low_max_age`, one collapsed stratum for **≥** `stratify_tail_high_min_age` (default **80**), and **5-year** bands in between—see `cnn_age_project/config.py`). Sparse strata are **merged** with neighbors until each has at least `stratify_min_subjects_per_stratum` subjects so train/val/test can all receive representation. Stratified splits use a **separate memmap cache** suffix (`*_auto_strat*` vs `*_auto*`). Disable with `--no-age-stratified-split` (random subject shuffle).
 
-**CNN training—balanced ages:** by default each epoch resamples training windows with probability proportional to **inverse stratum frequency** (same band definitions as above), similar to PyTorch `WeightedRandomSampler`. This **overrides** per-epoch subject-balanced window caps for the CNN loop when enabled; disable with `--no-age-weighted-window-sampling`.
+**CNN training—balanced ages:** by default each epoch **draws a fresh** multiset of training windows with probability proportional to **inverse stratum frequency** (same band definitions as above), similar to PyTorch `WeightedRandomSampler`. The number of draws per epoch is **`cnn_samples_per_epoch`** in `config.py` (default **2,000,000**), capped by the train pool; set to **`None`** in config for the legacy behavior (one draw per train window per epoch). Override on the CLI with **`--cnn-samples-per-epoch N`**; use **`0`** for the full train pool. This **overrides** per-epoch subject-balanced window caps for the CNN loop when enabled; disable weighting entirely with **`--no-age-weighted-window-sampling`**. Use **`scripts/report_train_stratum_window_counts.py`** for a data-driven `n_min × B` suggestion. Default **`epochs`** is **100** so total training exposure stays meaningful when epochs are shorter.
 
 **MIL training—balanced ages (subject-level):** by default each epoch draws train subjects **with replacement** with probability **∝ 1 / (number of train subjects in that age stratum)**, so each stratum gets equal aggregate sampling mass (same strata as above). **Validation/test MIL** still uses **one unweighted bag per subject** (natural age mix). Disable MIL weighting with `--no-mil-inverse-frequency-subject-sampling`.
 
@@ -320,6 +322,27 @@ python -m cnn_age_project.main --tune --model-mode cnn --tune-epochs 4 --tune-ma
 
 - Without `--tune-name`, the pipeline saves to `output/hparams/best_hyperparameters_<run_tag>.json` (run-unique timestamp), so existing files are not overwritten.
 - Tuning trial results are saved alongside the best-hyperparameters file as `<basename>_tuning_results.json` (e.g. `best_hyperparameters_expA_tuning_results.json`).
+
+### Parallel Optuna (Slurm array / multiple GPUs)
+
+To run **one shared study** across several jobs, use Optuna’s RDB storage:
+
+- **`--optuna-storage`**: Path to a SQLite file on **shared** storage (e.g. on CURC Alpine: `/scratch/alpine/$USER/optuna_cfs/my_study.db`) or a full URL such as `sqlite:////scratch/.../study.db`. The pipeline normalizes a plain path to `sqlite:///...`.
+- **`--optuna-study-name`**: The **same** study name on every worker (if omitted, the study name follows `--tune-name`, else `cfs_cnn_optuna`).
+- **`--tune-max-trials`**: Budget **per process**. Example: 3 array tasks × 16 trials each ⇒ 48 trials total in the shared study.
+- Prefer **`--tune` without `--tune-and-train`** on parallel workers so you do not launch multiple full training runs. When **all** tuning jobs finish, run **one** training job with `--hparams-file output/hparams/best_hyperparameters_<tune_name>.json`.
+- SQLite on NFS can be slow or lock-prone; use local/scratch paths where your cluster recommends active job I/O.
+
+Example pattern (three workers would use the same `OPTUNA_STORAGE` and `STUDY_NAME`):
+
+```bash
+python -m cnn_age_project.main --tune --tune-backend optuna \
+  --optuna-storage /scratch/alpine/$USER/optuna_cfs/mystudy.db \
+  --optuna-study-name my_shared_study --tune-name my_shared_study \
+  --tune-max-trials 16
+```
+
+See `slurm_cnn_age_array.sh` for a Slurm `#SBATCH --array` template.
 
 ### Tuning epochs and trials
 

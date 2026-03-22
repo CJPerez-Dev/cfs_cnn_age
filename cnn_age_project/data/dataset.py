@@ -88,6 +88,25 @@ def compute_train_window_stratum_sample_weights(
     return w.astype(np.float64)
 
 
+def resolve_cnn_age_weighted_epoch_num_samples(train_pool_size: int, configured: int | None) -> int:
+    """How many weighted draws to take for one CNN epoch under age-weighted sampling.
+
+    Args:
+        train_pool_size: Number of rows in the training pool (``len(train_indices)``).
+        configured: ``None`` or ``<= 0`` means use the full pool (legacy one-pass epoch).
+            Otherwise cap draws at ``min(configured, train_pool_size)``.
+
+    Returns:
+        int: Number of stochastic samples for ``sample_weighted_train_epoch_indices``.
+    """
+    n = int(train_pool_size)
+    if n <= 0:
+        return 0
+    if configured is None or int(configured) <= 0:
+        return n
+    return min(int(configured), n)
+
+
 def sample_weighted_train_epoch_indices(train_indices, weights, num_samples, rng, replace=True):
     """Draw ``num_samples`` global row indices with probability ∝ ``weights``.
 

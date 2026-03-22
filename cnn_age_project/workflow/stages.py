@@ -1,9 +1,10 @@
 """Top-level staged workflow for training, evaluation, and artifact export."""
 
+import copy
+import json
 import logging
 import os
 from datetime import datetime
-import copy
 from time import perf_counter
 
 import numpy as np
@@ -71,6 +72,7 @@ from cnn_age_project.config import (
     STRATIFY_TAIL_HIGH_MIN_AGE,
     STRATIFY_MIN_SUBJECTS_PER_STRATUM,
     AGE_WEIGHTED_WINDOW_SAMPLING,
+    CNN_SAMPLES_PER_EPOCH,
     VALIDATION_KEY_CSV,
     SPLIT_RATIO_TRAIN,
     SPLIT_RATIO_VAL,
@@ -92,6 +94,7 @@ from cnn_age_project.config import (
     DEFAULT_MODEL_PATH,
     DEFAULT_HPARAMS_PATH,
 )
+from cnn_age_project.data.dataset import resolve_cnn_age_weighted_epoch_num_samples
 from cnn_age_project.data.age_strata import (
     build_merged_strata_for_subjects,
     build_subject_code_stratum_lookup,
@@ -121,6 +124,7 @@ from cnn_age_project.evaluation.evaluation import (
     run_epoch_metrics,
 )
 from cnn_age_project.experiments.experiment_logger import (
+    _to_serializable,
     build_optuna_candidate,
     build_tuning_candidates,
     get_default_hyperparameters,
@@ -157,6 +161,83 @@ from cnn_age_project.workflow.types import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_optuna_storage_url(raw: str | None) -> str | None:
+    """Return an Optuna RDB URL, or None. Plain paths become sqlite absolute URLs."""
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    if "://" in s:
+        return s
+    path = os.path.abspath(os.path.expandvars(os.path.expanduser(s)))
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    path_posix = path.replace("\\", "/")
+    return "sqlite:///" + path_posix
+
+
+def _optuna_rebuild_tuning_results_from_study(study) -> list:
+    """Rebuild trial list from completed Optuna trials (requires user_attrs set in objective)."""
+    import optuna
+
+    out: list = []
+    for t in study.trials:
+        if t.state != optuna.trial.TrialState.COMPLETE:
+            continue
+        ua = t.user_attrs
+        hj = ua.get("hparams_json")
+        if hj is None:
+            continue
+        hparams = json.loads(hj) if isinstance(hj, str) else hj
+        out.append(
+            {
+                "hparams": hparams,
+                "test_loss": float(ua.get("test_loss", float("nan"))),
+                "test_r2": float(ua.get("test_r2", float("nan"))),
+                "test_mae": float(ua.get("test_mae", float("nan"))),
+                "selection_mae": float(ua.get("selection_mae", float("nan"))),
+                "trial_seconds": float(ua.get("trial_seconds", float("nan"))),
+                "trial_number": int(t.number),
+                "search_backend": "optuna",
+            }
+        )
+        if "val_mae" in ua:
+            out[-1]["val_mae"] = float(ua["val_mae"])
+    out.sort(key=lambda x: x["trial_number"])
+    return out
+
+
+def _run_under_exclusive_file_lock(lock_path: str, callback) -> None:
+    """Run callback while holding an exclusive lock (fcntl on Unix; no lock elsewhere)."""
+    try:
+        import fcntl
+    except ImportError:
+        callback()
+        return
+    lock_dir = os.path.dirname(lock_path)
+    if lock_dir:
+        os.makedirs(lock_dir, exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        try:
+            callback()
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UNLOCK)
+
+
+def _resolve_cnn_samples_per_epoch_arg(args):
+    """CLI override or ``CNN_SAMPLES_PER_EPOCH``; ``<= 0`` on CLI means use full train pool."""
+    if args is not None:
+        cli = getattr(args, "cnn_samples_per_epoch", None)
+        if cli is not None:
+            if cli <= 0:
+                return None
+            return int(cli)
+    return CNN_SAMPLES_PER_EPOCH
 
 
 def _run_candidate_trial(
@@ -206,6 +287,7 @@ def _run_candidate_trial(
             use_age_weighted_window_sampling=bool(
                 getattr(args, "age_weighted_window_sampling", AGE_WEIGHTED_WINDOW_SAMPLING)
             ),
+            cnn_samples_per_epoch=_resolve_cnn_samples_per_epoch_arg(args),
         )
 
     if mode_for_tune == "mil":
@@ -257,6 +339,7 @@ def _run_candidate_trial(
             use_age_weighted_window_sampling=bool(
                 getattr(args, "age_weighted_window_sampling", AGE_WEIGHTED_WINDOW_SAMPLING)
             ),
+            cnn_samples_per_epoch=_resolve_cnn_samples_per_epoch_arg(args),
         )
         mil_result = _run_mil_tuning_trial(
             trial_idx=trial_idx,
@@ -610,10 +693,14 @@ def setup_normalization_context(data_ctx: DataContext, rng, args=None):
             data_ctx.subject_codes,
             lookup,
         )
+        pool_n = int(data_ctx.train_indices.shape[0])
+        eff_draws = resolve_cnn_age_weighted_epoch_num_samples(pool_n, _resolve_cnn_samples_per_epoch_arg(args))
         logger.info(
-            "Age-weighted window sampling (inverse stratum frequency) | n_train_windows=%d mean_weight=%.4f",
-            int(data_ctx.train_indices.shape[0]),
+            "Age-weighted window sampling (inverse stratum frequency) | n_train_windows=%d mean_weight=%.4f | "
+            "epoch_draws=%d (fresh weighted shuffle each epoch)",
+            pool_n,
             float(np.mean(train_window_sample_weights)),
+            eff_draws,
         )
         if SUBJECT_BALANCED_TRAINING:
             logger.info(
@@ -930,6 +1017,9 @@ def select_hyperparameters(args, data_ctx: DataContext, norm_ctx: NormalizationC
         tuning_results = []
         tuning_start = perf_counter()
         best_so_far = None
+        use_shared_optuna_storage = False
+        optuna_storage_url = None
+        optuna_study_name = None
 
         mil_checkpoint_path = None
         base_cnn_state_dict = None
@@ -969,7 +1059,39 @@ def select_hyperparameters(args, data_ctx: DataContext, norm_ctx: NormalizationC
             else:
                 pruner = optuna.pruners.MedianPruner(n_startup_trials=max(1, startup_trials))
 
-            study = optuna.create_study(direction="minimize", sampler=sampler, pruner=pruner)
+            optuna_storage_url = _normalize_optuna_storage_url(getattr(args, "optuna_storage", None))
+            raw_study = getattr(args, "optuna_study_name", None)
+            if raw_study is not None and str(raw_study).strip():
+                optuna_study_name = str(raw_study).strip()
+            elif getattr(args, "tune_name", None):
+                optuna_study_name = str(args.tune_name).strip()
+            else:
+                optuna_study_name = "cfs_cnn_optuna"
+
+            if optuna_storage_url:
+                use_shared_optuna_storage = True
+                study = optuna.create_study(
+                    study_name=optuna_study_name,
+                    storage=optuna_storage_url,
+                    direction="minimize",
+                    sampler=sampler,
+                    pruner=pruner,
+                    load_if_exists=True,
+                )
+                logger.info(
+                    "Optuna **parallel** study | name=%s | storage=%s | this process runs up to %d trials "
+                    "(launch multiple jobs with the same study name + storage to share search)",
+                    optuna_study_name,
+                    optuna_storage_url,
+                    max_trials,
+                )
+                if bool(getattr(args, "tune_and_train", False)):
+                    logger.warning(
+                        "Distributed Optuna: `--tune-and-train` will train once per worker using best-so-far at "
+                        "process exit. Prefer `--tune` only on array workers, then a single job with `--hparams-file`."
+                    )
+            else:
+                study = optuna.create_study(direction="minimize", sampler=sampler, pruner=pruner)
 
             def _objective(trial):
                 trial_idx = int(trial.number) + 1
@@ -987,14 +1109,32 @@ def select_hyperparameters(args, data_ctx: DataContext, norm_ctx: NormalizationC
                 )
                 trial_result["trial_number"] = int(trial.number)
                 trial_result["search_backend"] = "optuna"
-                tuning_results.append(trial_result)
-                selection_mae = trial_result.get("selection_mae", trial_result["test_mae"])
-                trial.set_user_attr("selection_mae", float(selection_mae))
-                return float(selection_mae)
+                selection_mae = float(trial_result.get("selection_mae", trial_result["test_mae"]))
+                trial.set_user_attr("selection_mae", selection_mae)
+                trial.set_user_attr("test_mae", float(trial_result["test_mae"]))
+                trial.set_user_attr("test_loss", float(trial_result["test_loss"]))
+                tr2 = trial_result.get("test_r2", float("nan"))
+                trial.set_user_attr("test_r2", float(tr2) if np.isfinite(tr2) else float("nan"))
+                trial.set_user_attr("trial_seconds", float(trial_result.get("trial_seconds", float("nan"))))
+                trial.set_user_attr("hparams_json", json.dumps(_to_serializable(trial_result["hparams"])))
+                if trial_result.get("val_mae") is not None:
+                    vm = trial_result["val_mae"]
+                    trial.set_user_attr("val_mae", float(vm) if np.isfinite(vm) else float("nan"))
+                return selection_mae
 
             study.optimize(_objective, n_trials=max_trials, show_progress_bar=False)
+
+            if use_shared_optuna_storage:
+                study = optuna.load_study(study_name=optuna_study_name, storage=optuna_storage_url)
+            tuning_results = _optuna_rebuild_tuning_results_from_study(study)
+            if not tuning_results:
+                raise RuntimeError(
+                    "Optuna produced no completed trials with stored metrics (hparams_json). "
+                    "Check for pruned/failed trials or SQLite locking on shared filesystem."
+                )
             logger.info(
-                "Optuna study complete | best_trial=%d best_mae=%.3f",
+                "Optuna | completed_trials_with_metrics=%d | best_trial=%d best_selection_mae=%.3f",
+                len(tuning_results),
                 int(study.best_trial.number),
                 float(study.best_value),
             )
@@ -1046,6 +1186,7 @@ def select_hyperparameters(args, data_ctx: DataContext, norm_ctx: NormalizationC
 
         def _selection_mae(item):
             return item.get("selection_mae", item["test_mae"])
+
         best_trial = min(tuning_results, key=_selection_mae)
         active_hparams = best_trial["hparams"]
         # If the user provided a tune name, incorporate it into the saved filename.
@@ -1058,7 +1199,29 @@ def select_hyperparameters(args, data_ctx: DataContext, norm_ctx: NormalizationC
             # any existing `best_hyperparameters.json` provided by the repository.
             tag = run_ctx.run_tag if run_ctx is not None else datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             dest_path = os.path.join(hparams_dir, f"best_hyperparameters_{tag}.json")
-        save_best_hyperparameters(dest_path, active_hparams, tuning_results=tuning_results)
+
+        def _save_tune_outputs():
+            if use_shared_optuna_storage:
+                import optuna
+
+                s_fin = optuna.load_study(study_name=optuna_study_name, storage=optuna_storage_url)
+                tr = _optuna_rebuild_tuning_results_from_study(s_fin)
+                if not tr:
+                    logger.warning("Optuna parallel save skipped: no completed trials in study at lock time.")
+                    return
+                bt = min(tr, key=_selection_mae)
+                save_best_hyperparameters(dest_path, bt["hparams"], tuning_results=tr)
+            else:
+                save_best_hyperparameters(dest_path, active_hparams, tuning_results=tuning_results)
+
+        if use_shared_optuna_storage:
+            _run_under_exclusive_file_lock(
+                os.path.join(hparams_dir, ".optuna_parallel_hparams.lock"),
+                _save_tune_outputs,
+            )
+        else:
+            _save_tune_outputs()
+
         logger.info(
             "Best tune | selection_mae=%.3f test_mae=%.3f (%.1fs)",
             _selection_mae(best_trial),
@@ -1331,6 +1494,8 @@ def run_training_stage(
     if args is not None:
         use_aw = bool(getattr(args, "age_weighted_window_sampling", use_aw))
 
+    cnn_sp = _resolve_cnn_samples_per_epoch_arg(args)
+
     training = train_model(
         model=model,
         criterion=criterion,
@@ -1370,6 +1535,7 @@ def run_training_stage(
         grad_clip_norm=GRAD_CLIP_NORM,
         train_window_sample_weights=norm_ctx.train_window_sample_weights,
         use_age_weighted_window_sampling=use_aw,
+        cnn_samples_per_epoch=cnn_sp,
     )
 
     return TrainingContext(
@@ -1588,6 +1754,7 @@ def save_artifacts_and_summary(
     train_ctx: TrainingContext,
     eval_ctx: EvaluationContext,
     model_label="cnn",
+    run_args=None,
 ):
     """Persist model weights, plots, and textual/JSON run summaries.
 
@@ -1635,6 +1802,11 @@ def save_artifacts_and_summary(
     run_end_time = datetime.now()
     duration_seconds = (run_end_time - run_ctx.run_start_time).total_seconds()
 
+    cnn_sp_cfg = _resolve_cnn_samples_per_epoch_arg(run_args)
+    cnn_sp_effective = int(
+        resolve_cnn_age_weighted_epoch_num_samples(int(data_ctx.train_indices.size), cnn_sp_cfg)
+    )
+
     summary_payload = {
         "model_label": model_label,
         "run_timestamp": run_end_time.isoformat(timespec="seconds"),
@@ -1659,6 +1831,8 @@ def save_artifacts_and_summary(
         "stratify_min_subjects_per_stratum": STRATIFY_MIN_SUBJECTS_PER_STRATUM,
         "age_weighted_window_sampling": AGE_WEIGHTED_WINDOW_SAMPLING,
         "age_weighted_window_weights_built": norm_ctx.train_window_sample_weights is not None,
+        "cnn_samples_per_epoch_config": cnn_sp_cfg,
+        "cnn_age_weighted_epoch_draws_effective": cnn_sp_effective,
         "mil_inverse_frequency_subject_sampling": MIL_INVERSE_FREQUENCY_SUBJECT_SAMPLING,
         "mil_subject_draws_per_epoch_config": MIL_SUBJECT_DRAWS_PER_EPOCH,
         "subject_balanced_training": SUBJECT_BALANCED_TRAINING,
@@ -1869,6 +2043,7 @@ def execute_full_workflow(args):
             train_ctx,
             eval_ctx,
             model_label=model_label,
+            run_args=model_args,
         )
         model_summaries[model_label] = summary_payload
 

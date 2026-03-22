@@ -64,6 +64,23 @@ def parse_args():
         default=42,
         help="Random seed for Optuna sampler.",
     )
+    parser.add_argument(
+        "--optuna-storage",
+        type=str,
+        default=None,
+        help=(
+            "Optuna RDB URL or path to a SQLite file on **shared** storage (e.g. /scratch/alpine/$USER/optuna/cnn.db). "
+            "When set, multiple processes/jobs can load the same study (use the same --optuna-study-name). "
+            "Each process still runs --tune-max-trials trials (e.g. 3 jobs × 16 = 48 trials total). "
+            "Prefer `--tune` without `--tune-and-train` on workers, then one training job with --hparams-file."
+        ),
+    )
+    parser.add_argument(
+        "--optuna-study-name",
+        type=str,
+        default=None,
+        help="Optuna study name when using --optuna-storage (default: --tune-name or cfs_cnn_optuna).",
+    )
     parser.add_argument("--hparams-file", type=str, default=None, help="Path to a JSON file with hyperparameters to use for training (overrides saved defaults).")
     parser.add_argument(
         "--cnn-hparams-file",
@@ -116,6 +133,15 @@ def parse_args():
         action="store_false",
         default=True,
         help="Disable inverse-frequency age-stratum sampling for CNN training windows (WeightedRandomSampler-style).",
+    )
+    parser.add_argument(
+        "--cnn-samples-per-epoch",
+        type=int,
+        default=None,
+        help=(
+            "CNN age-weighted training: stochastic draws per epoch (default: config cnn_samples_per_epoch). "
+            "Each epoch resamples with replacement using inverse-stratum weights. Use 0 to use the full train pool per epoch."
+        ),
     )
     parser.add_argument(
         "--no-mil-inverse-frequency-subject-sampling",

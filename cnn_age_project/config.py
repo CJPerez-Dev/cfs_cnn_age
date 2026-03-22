@@ -20,7 +20,9 @@ class Config:
     subject_codebook_file: str = "subject_codebook_T1281.json"
 
     batch_size: int = 1024
-    epochs: int = 50
+    # With capped CNN age-weighted epochs (cnn_samples_per_epoch), more epochs are
+    # typical to match prior total training exposure; tune early_stopping_* if needed.
+    epochs: int = 100
     lr: float = 3e-4
 
     use_huber_loss: bool = True
@@ -109,6 +111,10 @@ class Config:
     # CNN training: sample windows with probability ∝ inverse stratum frequency (WeightedRandomSampler-style).
     # Takes precedence over subject_balanced_training when both are enabled.
     age_weighted_window_sampling: bool = True
+    # Stochastic draws per CNN epoch when age_weighted_window_sampling is True (fresh weighted shuffle each epoch).
+    # None = use every train window once per epoch (legacy). Use scripts/report_train_stratum_window_counts.py
+    # for a data-driven n_min * B estimate (~2M for many CFS-style splits).
+    cnn_samples_per_epoch: int | None = 2_000_000
 
     # Learning rate scheduler: "none", "plateau" (ReduceLROnPlateau on val loss), or "cosine"
     lr_scheduler: str = "plateau"
@@ -282,6 +288,7 @@ STRATIFY_TAIL_LOW_MAX_AGE = CONFIG.stratify_tail_low_max_age
 STRATIFY_TAIL_HIGH_MIN_AGE = CONFIG.stratify_tail_high_min_age
 STRATIFY_MIN_SUBJECTS_PER_STRATUM = CONFIG.stratify_min_subjects_per_stratum
 AGE_WEIGHTED_WINDOW_SAMPLING = CONFIG.age_weighted_window_sampling
+CNN_SAMPLES_PER_EPOCH = CONFIG.cnn_samples_per_epoch
 MIL_INVERSE_FREQUENCY_SUBJECT_SAMPLING = CONFIG.mil_inverse_frequency_subject_sampling
 MIL_SUBJECT_DRAWS_PER_EPOCH = CONFIG.mil_subject_draws_per_epoch
 SUBJECT_KEY_CSV = (

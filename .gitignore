@@ -75,6 +75,10 @@ docs/_build/
 *.png
 *.svg
 
+# HPC: local Slurm job scripts (partition/QoS/account are site-specific; do not commit)
+slurm_cnn_age.sh
+slurm_cnn_age_array.sh
+
 # Other
 *.zip
 *.tar.gz
