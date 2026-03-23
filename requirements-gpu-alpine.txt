@@ -1,8 +1,19 @@
-# Alpine / CURC (Linux) — use with `module load cuda/12.1.1`.
+# Alpine / CURC (Linux) — use with `module load cuda/12.1.1` on GPU jobs.
 # Do NOT use requirements-gpu.txt here (that pin is CUDA 13 / cu130).
 #
-# Install PyTorch for CUDA 12.1 first (separate step avoids pip picking a CPU wheel):
-#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+# Install PyTorch first (pick ONE that works for your Python — see docs/ALPINE_SETUP.md):
+#
+#   python -m pip install -U pip setuptools wheel
+#   python -V    # Prefer 3.10–3.12; 3.13 often has no cu121/cu124 wheels yet — load an older python module.
+#
+# Try A (CUDA 12.1 wheel index):
+#   pip install torch --extra-index-url https://download.pytorch.org/whl/cu121
+#
+# If "No matching distribution" / "versions: none", try B (newer CUDA 12.x wheels; OK with Alpine driver):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+#
+# Or pin a known build (adjust version if needed):
+#   pip install torch==2.5.1 --extra-index-url https://download.pytorch.org/whl/cu121
 #
 # Then:
 #   pip install -r requirements-gpu-alpine.txt

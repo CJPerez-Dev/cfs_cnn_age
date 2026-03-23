@@ -16,7 +16,7 @@ Window extraction for this project was performed through a private
 SOM-Neuro-BRAIN (University of Colorado Denver) repository workflow. That
 organization and its repositories are private and not open for access requests.
 If you already have access to the organization, you can run
-`Vibe-Modular-Event-Extration` to generate windows / fastpack / memmaps. The
+`Vibe-Modular-Event-Extraction` to generate windows / fastpack / memmaps. The
 produced fastpack contains the files used in `input/`.
 
 ## Multiple Instance Learning (MIL) — High-Level Overview
@@ -134,7 +134,7 @@ CPU-only:
 pip install -r requirements-cpu.txt
 ```
 
-GPU (CUDA 13.0 / cu130)
+GPU (CUDA 13.0 / cu130):
 
 Prerequisites: an NVIDIA GPU and matching drivers/CUDA runtime (CUDA 13.0 / cu130).
 If you need the CUDA runtime, download the CUDA Toolkit: https://developer.nvidia.com/cuda-downloads
@@ -144,8 +144,6 @@ Install GPU dependencies:
 ```bash
 pip install -r requirements-gpu.txt
 ```
-
-**CURC Alpine (HPC):** do not use `requirements-gpu.txt` on the cluster — it targets **CUDA 13 (cu130)** while Alpine’s module stack is **CUDA 12.1**. Use a **Linux** venv there, install **`cu121`** PyTorch, then `pip install -r requirements-gpu-alpine.txt`. Full step-by-step: [`docs/ALPINE_SETUP.md`](docs/ALPINE_SETUP.md).
 
 Quick verification:
 
@@ -164,7 +162,7 @@ Before running the CNN pipeline, you need the preprocessed EEG windows in the
 format expected by `cfs_cnn_age`. These can be produced using the
 Vibe-Modular-Event-Extraction repository belonging to SOM-Neuro-BRAIN.
 
-Steps to generate the input files:
+Steps to generate input files:
 
 #### Run Event Extraction
 
@@ -207,7 +205,7 @@ repository's `input/` folder so the CNN pipeline can access them.
 
 **Train/val/test split (default: auto-split)**
 
-By default the pipeline uses **auto-split**: a 70/15/15 subject-level train/validation/test split. In this mode you do **not** need separate training and testing key files.
+By default the pipeline uses **auto-split**: a 70/15/15 subject-level train/validation/test split. In this mode you do **not** need separate train/test key files.
 
 **Age stratification (default on):** subjects are assigned to age strata (one stratum for ages **below** `stratify_tail_low_max_age`, one collapsed stratum for **≥** `stratify_tail_high_min_age` (default **80**), and **5-year** bands in between—see `cnn_age_project/config.py`). Sparse strata are **merged** with neighbors until each has at least `stratify_min_subjects_per_stratum` subjects so train/val/test can all receive representation. Stratified splits use a **separate memmap cache** suffix (`*_auto_strat*` vs `*_auto*`). Disable with `--no-age-stratified-split` (random subject shuffle).
 
@@ -239,7 +237,7 @@ input/
 └─ README.md — input production notes
 ```
 
-**With `--no-auto-split`** you must also have `AgeTraining_Key.csv` and `AgeTesting_Key.csv` in `input/` (and no subject key is required for the split; ages come from those two files).
+With `--no-auto-split`, you must also have `AgeTraining_Key.csv` and `AgeTesting_Key.csv` in `input/` (no subject key file is required for splitting in that mode).
 
 ## Running the Project
 
@@ -322,27 +320,6 @@ python -m cnn_age_project.main --tune --model-mode cnn --tune-epochs 4 --tune-ma
 
 - Without `--tune-name`, the pipeline saves to `output/hparams/best_hyperparameters_<run_tag>.json` (run-unique timestamp), so existing files are not overwritten.
 - Tuning trial results are saved alongside the best-hyperparameters file as `<basename>_tuning_results.json` (e.g. `best_hyperparameters_expA_tuning_results.json`).
-
-### Parallel Optuna (Slurm array / multiple GPUs)
-
-To run **one shared study** across several jobs, use Optuna’s RDB storage:
-
-- **`--optuna-storage`**: Path to a SQLite file on **shared** storage (e.g. on CURC Alpine: `/scratch/alpine/$USER/optuna_cfs/my_study.db`) or a full URL such as `sqlite:////scratch/.../study.db`. The pipeline normalizes a plain path to `sqlite:///...`.
-- **`--optuna-study-name`**: The **same** study name on every worker (if omitted, the study name follows `--tune-name`, else `cfs_cnn_optuna`).
-- **`--tune-max-trials`**: Budget **per process**. Example: 3 array tasks × 16 trials each ⇒ 48 trials total in the shared study.
-- Prefer **`--tune` without `--tune-and-train`** on parallel workers so you do not launch multiple full training runs. When **all** tuning jobs finish, run **one** training job with `--hparams-file output/hparams/best_hyperparameters_<tune_name>.json`.
-- SQLite on NFS can be slow or lock-prone; use local/scratch paths where your cluster recommends active job I/O.
-
-Example pattern (three workers would use the same `OPTUNA_STORAGE` and `STUDY_NAME`):
-
-```bash
-python -m cnn_age_project.main --tune --tune-backend optuna \
-  --optuna-storage /scratch/alpine/$USER/optuna_cfs/mystudy.db \
-  --optuna-study-name my_shared_study --tune-name my_shared_study \
-  --tune-max-trials 16
-```
-
-See `slurm_cnn_age_array.sh` for a Slurm `#SBATCH --array` template.
 
 ### Tuning epochs and trials
 

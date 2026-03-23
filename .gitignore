@@ -62,6 +62,8 @@ Thumbs.db
 # ignore dirs
 input/
 output/
+# Local / private notes only (keep `docs/` on your machine; not published)
+docs/
 
 # ignore default model
 defaults/default_model.pt
@@ -71,7 +73,6 @@ defaults/default_model.pt
 !output/README.md
 
 # Temporary docs and exported images (optional)
-docs/_build/
 *.png
 *.svg
 
