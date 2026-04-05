@@ -137,10 +137,14 @@ class TrainingContext:
         triton_available: Whether Triton was available at runtime.
         compile_applied: Whether ``torch.compile`` was applied.
         train_losses: Epoch training losses.
+        val_losses: Per-epoch validation loss when a validation set is used (CNN); empty for MIL-only runs.
+        val_maes: Per-epoch validation MAE (years) when a validation set is used (CNN); empty otherwise.
         r2_scores: Epoch training R² values.
         maes: Epoch training MAE values.
-        best_loss: Best observed training loss.
-        best_epoch: Epoch number corresponding to best_loss.
+        best_loss: Best training loss at ``best_epoch`` (train loss, comparable across runs).
+        best_epoch: Epoch number chosen by early stopping (best monitor).
+        mil_early_stopping_monitor: For MIL: ``train_loss`` or ``val_mae`` when val monitoring is used.
+        best_val_mae_at_best_epoch: For MIL with val monitoring: validation bag MAE at ``best_epoch``.
     """
     model: Any
     criterion: Any
@@ -150,10 +154,14 @@ class TrainingContext:
     triton_available: bool
     compile_applied: bool
     train_losses: list[float]
+    val_losses: list[float]
+    val_maes: list[float]
     r2_scores: list[float]
     maes: list[float]
     best_loss: float
     best_epoch: int
+    mil_early_stopping_monitor: str | None = None
+    best_val_mae_at_best_epoch: float | None = None
 
 
 @dataclass

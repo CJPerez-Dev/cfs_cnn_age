@@ -84,7 +84,7 @@ cfs_cnn_age/
 ├─ output/                       # Generated artifacts
 │  └─ hparams/                   # Tuned hyperparameters
 ├─ scripts/                      # Utilities (merge_key_files.py, report_train_stratum_window_counts.py, …)
-├─ defaults/                     # Optional fallbacks (default_model.pt, default_hyperparameters.json)
+├─ defaults/                     # Optional fallbacks (default_model.pt, default_{cnn,mil}_hyperparameters.json)
 ├─ requirements-cpu.txt
 └─ requirements-gpu.txt
 ```
@@ -289,17 +289,19 @@ For reproducibility, prefer editing config values in one place rather than scatt
 You can place repository-level fallback files into `defaults/` at the repo root. Supported filenames:
 
 - `default_model.pt` — pretrained CNN checkpoint used by MIL when no `--mil-pretrained-model` is provided.
-- `default_hyperparameters.json` — hyperparameters used when no `--hparams-file` is provided (checked before `output/hparams/best_hyperparameters.json`).
+- `default_cnn_hyperparameters.json` — CNN training hyperparameters.
+- `default_mil_hyperparameters.json` — MIL hyperparameters.
+- `default_hyperparameters.json` (optional legacy) — single file with both CNN and MIL keys; merged before the split files so split entries override.
 
-See `defaults/README.md` for more details.
+See `defaults/README.md` for merge order and how CNN vs MIL vs joint tuning relates to these files.
 
 ## Using Hyperparameters and Tuning
 
-**Where hyperparameters come from when not tuning** (first match wins):
+**Where hyperparameters come from when not tuning:**
 
-1. `--hparams-file PATH` — explicit file you provide
-2. `defaults/default_hyperparameters.json` — repository defaults folder
-3. `output/hparams/best_hyperparameters.json` — previous tuning run or repo-provided file
+1. Code defaults, then merged with any of `defaults/default_hyperparameters.json` (legacy), `defaults/default_cnn_hyperparameters.json`, and `defaults/default_mil_hyperparameters.json` (later files override earlier; see `defaults/README.md`).
+2. `--hparams-file PATH` — merged on top of (1) when provided.
+3. `output/hparams/best_hyperparameters.json` — merged on top when present and no `--hparams-file`.
 
 To use a custom hyperparameter JSON file:
 
@@ -349,7 +351,7 @@ When using **key-file split** (`--no-auto-split`), caches are named e.g. `split_
 ### Tuning artifacts
 
 - Tuning outputs are written to `output/hparams/`.
-- Best hyperparameters are loaded from `defaults/default_hyperparameters.json` when present and no `--hparams-file` is given; otherwise from `output/hparams/best_hyperparameters.json`.
+- Best hyperparameters use the merged `defaults/*.json` files when present; otherwise from `output/hparams/best_hyperparameters.json` when no `--hparams-file` is given.
 - Each tuning run saves `best_hyperparameters_<name|run_tag>.json` and a matching `<basename>_tuning_results.json` in that folder.
 
 ### Per-run artifacts (timestamped output folder)

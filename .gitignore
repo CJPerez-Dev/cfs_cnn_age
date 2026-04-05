@@ -62,11 +62,15 @@ Thumbs.db
 # ignore dirs
 input/
 output/
+
 # Local / private notes only (keep `docs/` on your machine; not published)
 docs/
 
 # ignore default model
 defaults/default_model.pt
+
+# ignore old default hyperparameters
+defaults/default_hyperparameters_old.json
 
 # but keep these
 !input/README.md

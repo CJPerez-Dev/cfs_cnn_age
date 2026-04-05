@@ -83,7 +83,14 @@ def main() -> None:
 
     os.makedirs("output", exist_ok=True)
     out_path = os.path.join("output", "age_distribution_5Ybins.png")
-    _plot_hist(train_ages, val_ages, test_ages, bin_edges, out_path, "Age Distribution by Split (5-Year Bins)")
+    _plot_hist(
+        train_ages,
+        val_ages,
+        test_ages,
+        bin_edges,
+        out_path,
+        "Age Distribution by Split — CNN+MIL pipeline (5-Year Bins)",
+    )
     print(f"Saved: {out_path}")
 
     if args.with_stratified_bins:
@@ -112,7 +119,7 @@ def main() -> None:
             test_ages,
             strat_edges,
             strat_out,
-            "Age Distribution by Split (Stratification Bins)",
+            "Age Distribution by Split — CNN+MIL pipeline (Stratification Bins)",
         )
         print(f"Saved: {strat_out}")
 

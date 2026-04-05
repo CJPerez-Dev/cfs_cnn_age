@@ -93,6 +93,7 @@ from cnn_age_project.config import (
     PROJECT_DIR,
     DEFAULT_MODEL_PATH,
     DEFAULT_HPARAMS_PATH,
+    repo_defaults_json_present,
 )
 from cnn_age_project.data.dataset import resolve_cnn_age_weighted_epoch_num_samples
 from cnn_age_project.data.age_strata import (
@@ -128,6 +129,7 @@ from cnn_age_project.experiments.experiment_logger import (
     build_optuna_candidate,
     build_tuning_candidates,
     get_default_hyperparameters,
+    merge_repository_default_files,
     load_best_hyperparameters_if_available,
     save_model_comparison_summary,
     save_best_hyperparameters,
@@ -138,6 +140,7 @@ from cnn_age_project.training.trainer import (
     build_mil_gated_attention_model,
     configure_mil_finetune_optimizer,
     evaluate_mil_on_subject_bags,
+    mil_best_bag_attention_snapshot,
     run_mil_finetune_training,
     run_tuning_trial,
     setup_model_and_optimizers,
@@ -150,6 +153,7 @@ from cnn_age_project.visualization.plots import (
     save_subject_examples_report,
     save_training_report,
 )
+from cnn_age_project.visualization.presentation_plots import plot_mil_best_bag_attention_figure
 from cnn_age_project.workflow.types import (
     DataContext,
     EvaluationContext,
@@ -250,6 +254,7 @@ def _run_candidate_trial(
     norm_ctx,
     runtime_ctx,
     base_cnn_state_dict,
+    optuna_trial=None,
 ):
     """Run one candidate in cnn/mil/both mode and return tuning metrics."""
     if mode_for_tune == "cnn":
@@ -288,6 +293,7 @@ def _run_candidate_trial(
                 getattr(args, "age_weighted_window_sampling", AGE_WEIGHTED_WINDOW_SAMPLING)
             ),
             cnn_samples_per_epoch=_resolve_cnn_samples_per_epoch_arg(args),
+            optuna_trial=optuna_trial,
         )
 
     if mode_for_tune == "mil":
@@ -302,6 +308,7 @@ def _run_candidate_trial(
             rng=np.random.default_rng(RANDOM_SEED + trial_idx),
             base_cnn_state_dict=base_cnn_state_dict,
             args=args,
+            optuna_trial=optuna_trial,
         )
 
     if mode_for_tune == "both":
@@ -340,6 +347,7 @@ def _run_candidate_trial(
                 getattr(args, "age_weighted_window_sampling", AGE_WEIGHTED_WINDOW_SAMPLING)
             ),
             cnn_samples_per_epoch=_resolve_cnn_samples_per_epoch_arg(args),
+            optuna_trial=optuna_trial,
         )
         mil_result = _run_mil_tuning_trial(
             trial_idx=trial_idx,
@@ -352,6 +360,8 @@ def _run_candidate_trial(
             rng=np.random.default_rng(RANDOM_SEED + 10_000 + trial_idx),
             base_cnn_state_dict=base_cnn_state_dict,
             args=args,
+            optuna_trial=optuna_trial,
+            optuna_report_step_offset=int(args.tune_epochs),
         )
         cnn_sel = float(cnn_result.get("selection_mae", cnn_result["test_mae"]))
         mil_sel = float(mil_result.get("selection_mae", mil_result["test_mae"]))
@@ -740,6 +750,72 @@ def _resolve_cli_or_hparam(args, cli_attr, hparams, hparam_key, fallback):
     return fallback
 
 
+def _resolve_mil_subject_draws_per_epoch(args, hparams, mil_counts):
+    """How many subject-level pseudo-bags to draw per MIL epoch (inverse-frequency train only).
+
+    Precedence: ``--mil-subject-draws-multiplier`` >
+    ``--mil-subject-draws-per-epoch`` >
+    JSON ``mil_subject_draws_multiplier`` >
+    JSON ``mil_subject_draws_per_epoch`` >
+    ``MIL_SUBJECT_DRAWS_PER_EPOCH`` config.
+
+    Eligible subjects = train subjects with at least one window in ``mil_counts``.
+    """
+    counts = np.asarray(mil_counts, dtype=np.int64).ravel()
+    n_eligible = int(np.sum(counts > 0))
+    if n_eligible < 1:
+        n_eligible = 1
+
+    mult = getattr(args, "mil_subject_draws_multiplier", None) if args is not None else None
+    if mult is not None:
+        draws = max(1, int(round(float(mult) * n_eligible)))
+        logger.info(
+            "MIL subject draws | multiplier=%s × eligible_train_subjects=%d -> %d per epoch",
+            mult,
+            n_eligible,
+            draws,
+        )
+        return draws
+
+    explicit = getattr(args, "mil_subject_draws_per_epoch", None) if args is not None else None
+    if explicit is not None:
+        return int(explicit)
+
+    if isinstance(hparams, dict) and hparams.get("mil_subject_draws_multiplier") is not None:
+        mult = float(hparams["mil_subject_draws_multiplier"])
+        draws = max(1, int(round(mult * n_eligible)))
+        logger.info(
+            "MIL subject draws | hparams multiplier=%s × eligible_train_subjects=%d -> %d per epoch",
+            mult,
+            n_eligible,
+            draws,
+        )
+        return draws
+
+    if isinstance(hparams, dict) and hparams.get("mil_subject_draws_per_epoch") is not None:
+        return int(hparams["mil_subject_draws_per_epoch"])
+
+    return MIL_SUBJECT_DRAWS_PER_EPOCH
+
+
+def _resolve_mil_early_stopping_patience(args, hparams):
+    """CLI > JSON > config ``MIL_EARLY_STOPPING_PATIENCE``."""
+    if args is not None and getattr(args, "mil_early_stopping_patience", None) is not None:
+        return int(args.mil_early_stopping_patience)
+    if isinstance(hparams, dict) and hparams.get("mil_early_stopping_patience") is not None:
+        return int(hparams["mil_early_stopping_patience"])
+    return MIL_EARLY_STOPPING_PATIENCE
+
+
+def _resolve_mil_early_stopping_min_epochs(args, hparams):
+    """CLI > JSON > config ``MIL_EARLY_STOPPING_MIN_EPOCHS``."""
+    if args is not None and getattr(args, "mil_early_stopping_min_epochs", None) is not None:
+        return int(args.mil_early_stopping_min_epochs)
+    if isinstance(hparams, dict) and hparams.get("mil_early_stopping_min_epochs") is not None:
+        return int(hparams["mil_early_stopping_min_epochs"])
+    return MIL_EARLY_STOPPING_MIN_EPOCHS
+
+
 def _run_mil_tuning_trial(
     trial_idx,
     total_trials,
@@ -751,6 +827,8 @@ def _run_mil_tuning_trial(
     rng,
     base_cnn_state_dict,
     args,
+    optuna_trial=None,
+    optuna_report_step_offset: int = 0,
 ):
     """Run one MIL hyperparameter tuning trial and return held-out metrics.
 
@@ -802,6 +880,9 @@ def _run_mil_tuning_trial(
     amp_enabled = runtime_ctx.device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
+    mil_es_patience = _resolve_mil_early_stopping_patience(args, hparams)
+    mil_es_min_epochs = _resolve_mil_early_stopping_min_epochs(args, hparams)
+
     bag_size = int(hparams.get("mil_bag_size", MIL_PSEUDO_BAG_MIN_WINDOWS))
     sampling_strategy = str(hparams.get("mil_sampling_strategy", "random"))
 
@@ -840,13 +921,25 @@ def _run_mil_tuning_trial(
         sampling_strategy=sampling_strategy,
         debug_chunk_log_every=DEBUG_CHUNK_LOG_EVERY,
         amp_enabled=amp_enabled,
+        early_stopping_enabled=MIL_EARLY_STOPPING_ENABLED,
+        early_stopping_patience=mil_es_patience,
+        early_stopping_min_epochs=mil_es_min_epochs,
+        early_stopping_min_delta_abs=MIL_EARLY_STOPPING_MIN_DELTA_ABS,
+        early_stopping_min_delta_rel=MIL_EARLY_STOPPING_MIN_DELTA_REL,
         subject_codebook=data_ctx.subject_codebook,
         train_age_map=data_ctx.train_age_map,
         subject_stratum_merged=data_ctx.subject_stratum_merged,
         mil_inverse_frequency_subject_sampling=bool(
             getattr(args, "mil_inverse_frequency_subject_sampling", MIL_INVERSE_FREQUENCY_SUBJECT_SAMPLING)
         ),
-        mil_subject_draws_per_epoch=MIL_SUBJECT_DRAWS_PER_EPOCH,
+        mil_subject_draws_per_epoch=_resolve_mil_subject_draws_per_epoch(args, hparams, train_counts),
+        val_indices=data_ctx.val_indices,
+        subject_codes=data_ctx.subject_codes,
+        n_subjects=len(data_ctx.subject_codebook),
+        mil_early_stopping_monitor=str(getattr(args, "mil_early_stopping_monitor", None) or "auto").strip().lower(),
+        mil_eval_batch_size=MIL_BAG_BATCH_SIZE,
+        optuna_trial=optuna_trial,
+        optuna_report_step_offset=int(optuna_report_step_offset),
     )
 
     # Test split: reported only (do not use for hyperparameter selection).
@@ -971,15 +1064,16 @@ def select_hyperparameters(args, data_ctx: DataContext, norm_ctx: NormalizationC
             else MIL_ALLOW_REPLACEMENT_WHEN_SMALL
         ),
     )
+    defaults = merge_repository_default_files(defaults)
     # Determine where to source or save best hyperparameters.
     # Priority order when not tuning:
     # 1) `--hparams-file` provided by user
-    # 2) repo-provided `defaults/default_hyperparameters.json` (root defaults)
-    # 3) repo-provided `output/hparams/best_hyperparameters.json`
-    # 4) output folder `output/hparams/best_hyperparameters.json`
+    # 2) repo-provided `output/hparams/best_hyperparameters.json` (merged on top of ``defaults/``)
+    # Code defaults plus `defaults/default_hyperparameters.json` (legacy) and/or
+    # `defaults/default_cnn_hyperparameters.json` and `defaults/default_mil_hyperparameters.json`
+    # are merged into ``defaults`` above via ``merge_repository_default_files``.
     best_hparams_path = os.path.join(OUTPUT_DIR, "hparams", BEST_HPARAMS_FILE)
     repo_hparams_path = os.path.join(PROJECT_DIR, "output", "hparams", BEST_HPARAMS_FILE)
-    default_hparams_path = DEFAULT_HPARAMS_PATH
     if args.hparams_file:
         # Accept absolute paths, repo-relative paths, and POSIX-style "/output/..." paths
         # that commonly appear when copying commands across shells/OSes.
@@ -1106,6 +1200,7 @@ def select_hyperparameters(args, data_ctx: DataContext, norm_ctx: NormalizationC
                     norm_ctx=norm_ctx,
                     runtime_ctx=runtime_ctx,
                     base_cnn_state_dict=base_cnn_state_dict,
+                    optuna_trial=trial,
                 )
                 trial_result["trial_number"] = int(trial.number)
                 trial_result["search_backend"] = "optuna"
@@ -1229,12 +1324,10 @@ def select_hyperparameters(args, data_ctx: DataContext, norm_ctx: NormalizationC
             perf_counter() - tuning_start,
         )
     else:
-        # Prefer explicit CLI file, then repository defaults (defaults/), then repo hparams output.
-        if not args.hparams_file:
-            if os.path.exists(default_hparams_path):
-                best_hparams_path = default_hparams_path
-            elif os.path.exists(repo_hparams_path):
-                best_hparams_path = repo_hparams_path
+        # Prefer explicit CLI file, then ``output/hparams/best_hyperparameters.json`` merged on top.
+        # Repository ``defaults/*.json`` are already merged into ``defaults``.
+        if not args.hparams_file and os.path.exists(repo_hparams_path):
+            best_hparams_path = repo_hparams_path
         active_hparams = load_best_hyperparameters_if_available(best_hparams_path, defaults)
         logger.debug("Active hyperparameters: %s", active_hparams)
 
@@ -1410,6 +1503,14 @@ def run_training_stage(
         amp_enabled = runtime_ctx.device.type == "cuda"
         scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
+        mil_es_patience = _resolve_mil_early_stopping_patience(args, active_hparams)
+        mil_es_min_epochs = _resolve_mil_early_stopping_min_epochs(args, active_hparams)
+        mil_es_monitor = (
+            str(getattr(args, "mil_early_stopping_monitor", None) or "auto").strip().lower()
+            if args is not None
+            else "auto"
+        )
+
         log_stage("MIL Fine-Tuning", logger)
         training = run_mil_finetune_training(
             mil_model=mil_model,
@@ -1437,8 +1538,8 @@ def run_training_stage(
             debug_chunk_log_every=DEBUG_CHUNK_LOG_EVERY,
             amp_enabled=amp_enabled,
             early_stopping_enabled=MIL_EARLY_STOPPING_ENABLED,
-            early_stopping_patience=MIL_EARLY_STOPPING_PATIENCE,
-            early_stopping_min_epochs=MIL_EARLY_STOPPING_MIN_EPOCHS,
+            early_stopping_patience=mil_es_patience,
+            early_stopping_min_epochs=mil_es_min_epochs,
             early_stopping_min_delta_abs=MIL_EARLY_STOPPING_MIN_DELTA_ABS,
             early_stopping_min_delta_rel=MIL_EARLY_STOPPING_MIN_DELTA_REL,
             grad_clip_norm=GRAD_CLIP_NORM,
@@ -1450,11 +1551,12 @@ def run_training_stage(
             mil_inverse_frequency_subject_sampling=bool(
                 getattr(args, "mil_inverse_frequency_subject_sampling", MIL_INVERSE_FREQUENCY_SUBJECT_SAMPLING)
             ),
-            mil_subject_draws_per_epoch=(
-                int(active_hparams["mil_subject_draws_per_epoch"])
-                if active_hparams.get("mil_subject_draws_per_epoch") is not None
-                else MIL_SUBJECT_DRAWS_PER_EPOCH
-            ),
+            mil_subject_draws_per_epoch=_resolve_mil_subject_draws_per_epoch(args, active_hparams, mil_counts),
+            val_indices=data_ctx.val_indices,
+            subject_codes=data_ctx.subject_codes,
+            n_subjects=len(data_ctx.subject_codebook),
+            mil_early_stopping_monitor=mil_es_monitor,
+            mil_eval_batch_size=MIL_BAG_BATCH_SIZE,
         )
 
         return TrainingContext(
@@ -1466,10 +1568,14 @@ def run_training_stage(
             triton_available=False,
             compile_applied=False,
             train_losses=training["train_losses"],
+            val_losses=training.get("val_losses", []),
+            val_maes=training.get("val_maes", []),
             r2_scores=training["r2_scores"],
             maes=training["maes"],
             best_loss=training["best_loss"],
             best_epoch=training["best_epoch"],
+            mil_early_stopping_monitor=training.get("mil_early_stopping_monitor"),
+            best_val_mae_at_best_epoch=training.get("best_val_mae_at_best_epoch"),
         )
 
     log_stage("Model Setup", logger)
@@ -1547,6 +1653,8 @@ def run_training_stage(
         triton_available=triton_available,
         compile_applied=compile_applied,
         train_losses=training["train_losses"],
+        val_losses=training.get("val_losses", []),
+        val_maes=training.get("val_maes", []),
         r2_scores=training["r2_scores"],
         maes=training["maes"],
         best_loss=training["best_loss"],
@@ -1561,6 +1669,7 @@ def run_evaluation_stage(
     hparam_ctx: HyperparameterContext | None,
     runtime_ctx: RuntimeContext,
     rng,
+    run_output_dir: str | None = None,
 ):
     """Run held-out evaluation, baseline comparison, and subject-example selection.
 
@@ -1568,8 +1677,10 @@ def run_evaluation_stage(
         data_ctx (DataContext): Loaded data context.
         norm_ctx (NormalizationContext): Normalization context.
         train_ctx (TrainingContext): Outputs from training stage.
+        hparam_ctx (HyperparameterContext | None): Hyperparameter context.
         runtime_ctx (RuntimeContext): Runtime context with selected device.
         rng (np.random.Generator): Random generator for bootstrap/examples.
+        run_output_dir (str | None): If set for MIL runs, writes ``mil_attention_best_bag.png``.
 
     Returns:
         EvaluationContext: Evaluation metrics, baseline metrics, and subject examples.
@@ -1623,6 +1734,36 @@ def run_evaluation_stage(
         sum_true_by_subject = mil_eval["sum_true_by_subject"]
         sum_pred_by_subject = mil_eval["sum_pred_by_subject"]
         count_by_subject = mil_eval["count_by_subject"]
+
+        if run_output_dir is not None:
+            try:
+                att_snap = mil_best_bag_attention_snapshot(
+                    mil_model=train_ctx.model,
+                    x_mem=data_ctx.x_mem,
+                    y_mem=data_ctx.y_mem,
+                    eval_indices=data_ctx.test_indices,
+                    subject_codes=data_ctx.subject_codes,
+                    n_subjects=len(data_ctx.subject_codebook),
+                    batch_size=MIL_BAG_BATCH_SIZE,
+                    device=runtime_ctx.device,
+                    x_mean=norm_ctx.x_mean,
+                    x_std=norm_ctx.x_std,
+                    y_mean=norm_ctx.y_mean,
+                    y_std=norm_ctx.y_std,
+                    normalize_target=NORMALIZE_TARGET,
+                    pseudo_bag_min_windows=eval_bag_size,
+                    pseudo_bag_max_windows=eval_bag_size,
+                    allow_replacement_when_small=eval_allow_replacement,
+                    sampling_strategy=eval_sampling_strategy,
+                    diagnostic_seed=RANDOM_SEED + 777,
+                    subject_codebook=data_ctx.subject_codebook,
+                )
+                if att_snap:
+                    att_path = os.path.join(run_output_dir, "mil_attention_best_bag.png")
+                    plot_mil_best_bag_attention_figure(att_snap, att_path)
+                    logger.info("MIL attention diagnostic saved to %s", att_path)
+            except Exception as exc:
+                logger.warning("MIL attention diagnostic plot skipped: %s", exc)
     else:
         test_loss, test_r2, test_mae, final_targets, final_preds, sum_true_by_subject, sum_pred_by_subject, count_by_subject = run_epoch_metrics(
             model=train_ctx.model,
@@ -1781,15 +1922,17 @@ def save_artifacts_and_summary(
         run_output_dir=run_ctx.run_output_dir,
         run_tag=run_ctx.run_tag,
         report_save_name=REPORT_SAVE_NAME,
-        train_losses=train_ctx.train_losses,
+        train_maes=train_ctx.maes,
+        val_maes=train_ctx.val_maes,
         r2_scores=train_ctx.r2_scores,
-        maes=train_ctx.maes,
-        baseline_loss=eval_ctx.baseline_loss,
         baseline_mae=eval_ctx.baseline_mae,
         baseline_r2=eval_ctx.baseline_r2,
         test_mae=eval_ctx.test_mae,
+        test_r2=eval_ctx.test_r2,
         final_targets=eval_ctx.final_targets,
         final_preds=eval_ctx.final_preds,
+        subject_test_mae=eval_ctx.subj_mae,
+        subject_test_r2=eval_ctx.subj_r2,
     )
 
     subject_report_path = save_subject_examples_report(
@@ -1852,8 +1995,15 @@ def save_artifacts_and_summary(
         "n_test_subjects_csv": int(len(data_ctx.test_age_map)),
         "n_test_subjects_evaluated": int(len(eval_ctx.subj_ids)),
         "epochs_completed": int(len(train_ctx.train_losses)),
+        "train_losses": train_ctx.train_losses,
+        "val_losses": train_ctx.val_losses,
+        "val_maes": train_ctx.val_maes,
+        "train_maes": train_ctx.maes,
+        "train_r2_scores": train_ctx.r2_scores,
         "best_epoch": int(train_ctx.best_epoch),
         "best_train_loss": float(train_ctx.best_loss),
+        "mil_early_stopping_monitor": getattr(train_ctx, "mil_early_stopping_monitor", None),
+        "mil_best_val_mae_at_best_epoch": getattr(train_ctx, "best_val_mae_at_best_epoch", None),
         "test_loss": float(eval_ctx.test_loss),
         "test_r2": float(eval_ctx.test_r2) if np.isfinite(eval_ctx.test_r2) else np.nan,
         "test_mae": float(eval_ctx.test_mae),
@@ -1927,7 +2077,7 @@ def _resolve_model_hparams_file(args, model_label: str) -> str | None:
     Precedence (per model):
     - --cnn-hparams-file / --mil-hparams-file (when provided)
     - --hparams-file (shared)
-    - defaults/default_hyperparameters.json (handled by select_hyperparameters)
+    - defaults/default_{cnn,mil}_hyperparameters.json or legacy default_hyperparameters.json
     """
     if model_label == "cnn":
         return getattr(args, "cnn_hparams_file", None) or getattr(args, "hparams_file", None)
@@ -1952,12 +2102,20 @@ def execute_full_workflow(args):
     model_labels = _resolve_model_modes(args)
 
     # Preconditions for defaults: if the run includes MIL, require a pretrained
-    # CNN checkpoint either via CLI or the repository `defaults/` folder. If the
-    # run mode is `both`, prefer explicit hyperparameters via `--hparams-file`
-    # or a `defaults/default_hyperparameters.json` file in the repo root.
+    # CNN checkpoint either via CLI or the repository `defaults/` folder. In
+    # `both` mode without `--mil-pretrained-model`, the CNN stage saves weights
+    # first and MIL loads that path — so missing `defaults/default_model.pt` is OK.
     if "mil" in model_labels:
         mil_candidate = getattr(args, "mil_pretrained_model", None) or DEFAULT_MODEL_PATH
-        if not mil_candidate or not os.path.exists(mil_candidate):
+        both_without_cli_mil = (
+            getattr(args, "model_mode", None) == "both" and not getattr(args, "mil_pretrained_model", None)
+        )
+        if both_without_cli_mil and not os.path.exists(DEFAULT_MODEL_PATH):
+            logger.info(
+                "Both mode: MIL will load the CNN saved in this run (no %s on disk).",
+                DEFAULT_MODEL_PATH,
+            )
+        elif not mil_candidate or not os.path.exists(mil_candidate):
             raise FileNotFoundError(
                 "MIL mode requires a pretrained CNN checkpoint.\n"
                 "Provide one with the CLI flag `--mil-pretrained-model PATH` or\n"
@@ -1973,15 +2131,16 @@ def execute_full_workflow(args):
             or getattr(args, "cnn_hparams_file", None)
             or getattr(args, "mil_hparams_file", None)
         )
-        if (not has_any_cli_hparams) and (not os.path.exists(DEFAULT_HPARAMS_PATH)):
+        if (not has_any_cli_hparams) and (not repo_defaults_json_present()):
             repo_hparams_path = os.path.join(PROJECT_DIR, "output", "hparams", BEST_HPARAMS_FILE)
             if not os.path.exists(repo_hparams_path):
                 raise FileNotFoundError(
                     "`both` mode requires a hyperparameters JSON file.\n"
                     "Provide one with the CLI flag `--hparams-file PATH` (shared) or\n"
                     "provide per-model files with `--cnn-hparams-file PATH` and/or `--mil-hparams-file PATH`, or\n"
-                    f"place a file named '{os.path.basename(DEFAULT_HPARAMS_PATH)}' in the repository 'defaults' folder: {os.path.dirname(DEFAULT_HPARAMS_PATH)}\n"
-                    "Example: defaults/default_hyperparameters.json"
+                    f"place defaults under `{os.path.dirname(DEFAULT_HPARAMS_PATH)}`: "
+                    "`default_hyperparameters.json` (legacy combined), and/or "
+                    "`default_cnn_hyperparameters.json` and/or `default_mil_hyperparameters.json`."
                 )
 
     # Global hyperparameters context:
@@ -2012,6 +2171,7 @@ def execute_full_workflow(args):
             _resolve_model_hparams_file(args, "mil") or "defaults",
         )
 
+    cnn_checkpoint_from_run: str | None = None
     for model_label in model_labels:
         log_stage(f"Model Run: {model_label.upper()}", logger)
         model_output_dir = os.path.join(run_ctx.run_output_dir, model_label)
@@ -2023,6 +2183,17 @@ def execute_full_workflow(args):
             rng=run_ctx.rng,
             run_output_dir=model_output_dir,
         )
+        if (
+            model_label == "mil"
+            and getattr(args, "model_mode", None) == "both"
+            and not getattr(args, "mil_pretrained_model", None)
+            and cnn_checkpoint_from_run
+        ):
+            args.mil_pretrained_model = cnn_checkpoint_from_run
+            logger.info(
+                "Both mode: MIL encoder will load CNN from this run | %s",
+                cnn_checkpoint_from_run,
+            )
         model_args = _build_model_args(args, model_label)
         # Allow separate tuned hyperparameter files per model in `both` mode.
         # This enables a fair "best CNN" vs "best CNN+MIL" comparison.
@@ -2033,7 +2204,15 @@ def execute_full_workflow(args):
             model_hparam_ctx = hparam_ctx
 
         train_ctx = run_training_stage(data_ctx, norm_ctx, model_hparam_ctx, runtime_ctx, run_ctx.rng, model_args)
-        eval_ctx = run_evaluation_stage(data_ctx, norm_ctx, train_ctx, model_hparam_ctx, runtime_ctx, run_ctx.rng)
+        eval_ctx = run_evaluation_stage(
+            data_ctx,
+            norm_ctx,
+            train_ctx,
+            model_hparam_ctx,
+            runtime_ctx,
+            run_ctx.rng,
+            run_output_dir=model_output_dir,
+        )
         summary_payload = save_artifacts_and_summary(
             model_run_ctx,
             runtime_ctx,
@@ -2046,6 +2225,12 @@ def execute_full_workflow(args):
             run_args=model_args,
         )
         model_summaries[model_label] = summary_payload
+        if model_label == "cnn" and getattr(args, "model_mode", None) == "both":
+            cnn_checkpoint_from_run = summary_payload.get("model_path")
+            if not cnn_checkpoint_from_run or not os.path.isfile(cnn_checkpoint_from_run):
+                raise RuntimeError(
+                    "Both mode expected a CNN checkpoint path after the CNN run; got: %r" % (cnn_checkpoint_from_run,)
+                )
 
     if "cnn" in model_summaries and "mil" in model_summaries:
         log_stage("CNN vs MIL Comparison", logger)

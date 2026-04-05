@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Plot age-stratum sampling diagnostics for CNN and MIL.
+"""Plot age-stratum sampling diagnostics for CNN and CNN+MIL.
 
 Creates one figure that compares:
 1) Raw train-window distribution by age stratum
 2) CNN weighted epoch sampling distribution by age stratum
-3) MIL subject-weighted pseudo-bag sampling distribution by age stratum
+3) CNN+MIL subject-weighted pseudo-bag sampling distribution by age stratum
 
 Output: output/age_sampling_diagnostics_stratified.png
 """
@@ -95,7 +95,7 @@ def main() -> None:
     cnn_epoch_idx = sample_weighted_train_epoch_indices(train_idx, w, n_draws, rng, replace=True)
     cnn_counts = _counts_by_stratum(cnn_epoch_idx, data_ctx.subject_codes, code_lookup)
 
-    # 3) MIL subject-weighted pseudo-bag sampling distribution (one synthetic epoch).
+    # 3) CNN+MIL subject-weighted pseudo-bag sampling distribution (one synthetic epoch).
     sorted_idx, offsets, counts = build_subject_group_index(
         train_indices=train_idx,
         subject_codes=data_ctx.subject_codes,
@@ -152,9 +152,16 @@ def main() -> None:
     fig, ax = plt.subplots(figsize=(11, 6))
     ax.bar(x - width, raw_pct, width, label=f"Raw train windows (n={raw_counts.sum():,})", color="#1f77b4", alpha=0.85)
     ax.bar(x, cnn_pct, width, label=f"CNN sampled epoch (n={cnn_counts.sum():,})", color="#ff7f0e", alpha=0.85)
-    ax.bar(x + width, mil_pct, width, label=f"MIL sampled epoch windows (n={mil_counts.sum():,})", color="#2ca02c", alpha=0.85)
+    ax.bar(
+        x + width,
+        mil_pct,
+        width,
+        label=f"CNN+MIL model sampled epoch windows (n={mil_counts.sum():,})",
+        color="#2ca02c",
+        alpha=0.85,
+    )
 
-    ax.set_title("Age-Stratum Sampling Diagnostics (CNN + MIL)")
+    ax.set_title("Age-Stratum Sampling Diagnostics (CNN+MIL model)")
     ax.set_xlabel("Age stratum id (merged)")
     ax.set_ylabel("Share of windows in sampled set (%)")
     ax.set_xticks(x)
@@ -170,7 +177,7 @@ def main() -> None:
 
     print(f"Saved: {out_path}")
     print(
-        "Counts | raw_train=%d cnn_sampled=%d mil_sampled_windows=%d strata=%d"
+        "Counts | raw_train=%d cnn_sampled=%d cnn_mil_sampled_windows=%d strata=%d"
         % (int(raw_counts.sum()), int(cnn_counts.sum()), int(mil_counts.sum()), n_strata)
     )
 

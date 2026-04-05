@@ -1,0 +1,16 @@
+{
+  "mil_attention_dim": 128,
+  "mil_attention_dropout": 0.2,
+  "mil_pooling_type": "gated",
+  "mil_bag_size": 128,
+  "mil_sampling_strategy": "random",
+  "mil_encoder_lr": 1e-06,
+  "mil_head_lr": 0.001,
+  "mil_weight_decay": 0.01,
+  "mil_regressor_hidden_dim": 64,
+  "mil_regressor_dropout": 0.2,
+  "mil_allow_replacement_when_small": true,
+  "mil_subject_draws_multiplier": 2,
+  "mil_early_stopping_patience": 6,
+  "mil_early_stopping_min_epochs": 8
+}

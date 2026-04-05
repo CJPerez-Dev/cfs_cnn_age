@@ -6,7 +6,12 @@ import os
 
 import numpy as np
 
-from cnn_age_project.config import TUNING_RESULTS_FILE
+from cnn_age_project.config import (
+    DEFAULT_CNN_HPARAMS_PATH,
+    DEFAULT_HPARAMS_PATH,
+    DEFAULT_MIL_HPARAMS_PATH,
+    TUNING_RESULTS_FILE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +88,53 @@ def get_default_hyperparameters(
         "mil_regressor_hidden_dim": mil_regressor_hidden_dim,
         "mil_regressor_dropout": float(mil_regressor_dropout),
         "mil_allow_replacement_when_small": bool(mil_allow_replacement_when_small),
+        # MIL training schedule (optional; None → config / CLI resolution in workflow)
+        "mil_subject_draws_per_epoch": None,
+        "mil_subject_draws_multiplier": None,
+        "mil_early_stopping_patience": None,
+        "mil_early_stopping_min_epochs": None,
     }
+
+
+def merge_json_file_into_defaults(defaults: dict, path: str) -> dict:
+    """Merge keys from a JSON file into ``defaults`` (only keys present in ``defaults``).
+
+    Args:
+        defaults: Baseline hyperparameter dictionary.
+        path: Path to JSON file (ignored if missing).
+
+    Returns:
+        Updated copy of ``defaults``.
+    """
+    if not path or not os.path.exists(path):
+        return defaults.copy()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        merged = defaults.copy()
+        merged.update({k: loaded[k] for k in defaults.keys() if k in loaded})
+        return merged
+    except Exception as exc:
+        logger.warning("Failed to merge hyperparameters from %s (%s). Using previous defaults.", path, exc)
+        return defaults.copy()
+
+
+def merge_repository_default_files(defaults: dict) -> dict:
+    """Merge ``defaults/`` JSON files onto code defaults.
+
+    Order (later overrides earlier): legacy combined file, then CNN split, then MIL split.
+
+    Args:
+        defaults: Typically from :func:`get_default_hyperparameters`.
+
+    Returns:
+        dict: Merged hyperparameters.
+    """
+    merged = defaults.copy()
+    merged = merge_json_file_into_defaults(merged, DEFAULT_HPARAMS_PATH)
+    merged = merge_json_file_into_defaults(merged, DEFAULT_CNN_HPARAMS_PATH)
+    merged = merge_json_file_into_defaults(merged, DEFAULT_MIL_HPARAMS_PATH)
+    return merged
 
 
 def load_best_hyperparameters_if_available(path, defaults):
@@ -337,6 +388,8 @@ def save_run_summary(data_dir, summary_dict, run_tag):
         f"Epochs Completed: {serializable.get('epochs_completed', 'n/a')}",
         f"Best Epoch: {serializable.get('best_epoch', 'n/a')}",
         f"Best Train Loss: {serializable.get('best_train_loss', 'n/a')}",
+        f"MIL Early Stopping Monitor: {serializable.get('mil_early_stopping_monitor', 'n/a')}",
+        f"MIL Best Val MAE (at best epoch): {serializable.get('mil_best_val_mae_at_best_epoch', 'n/a')}",
         "",
         "Window-Level Test Metrics",
         "-" * 80,

@@ -151,6 +151,8 @@ class Config:
     defaults_dir_name: str = "defaults"
     default_model_file: str = "default_model.pt"
     default_hparams_file: str = "default_hyperparameters.json"
+    default_cnn_hparams_file: str = "default_cnn_hyperparameters.json"
+    default_mil_hparams_file: str = "default_mil_hyperparameters.json"
 
     @property
     def input_dir(self):
@@ -322,3 +324,14 @@ TUNING_RESULTS_FILE = CONFIG.tuning_results_file
 DEFAULTS_DIR = os.path.join(PROJECT_DIR, CONFIG.defaults_dir_name)
 DEFAULT_MODEL_PATH = os.path.join(DEFAULTS_DIR, CONFIG.default_model_file)
 DEFAULT_HPARAMS_PATH = os.path.join(DEFAULTS_DIR, CONFIG.default_hparams_file)
+DEFAULT_CNN_HPARAMS_PATH = os.path.join(DEFAULTS_DIR, CONFIG.default_cnn_hparams_file)
+DEFAULT_MIL_HPARAMS_PATH = os.path.join(DEFAULTS_DIR, CONFIG.default_mil_hparams_file)
+
+
+def repo_defaults_json_present() -> bool:
+    """True if any repository defaults hyperparameter JSON exists under ``defaults/``."""
+    return (
+        os.path.exists(DEFAULT_HPARAMS_PATH)
+        or os.path.exists(DEFAULT_CNN_HPARAMS_PATH)
+        or os.path.exists(DEFAULT_MIL_HPARAMS_PATH)
+    )

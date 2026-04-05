@@ -50,7 +50,10 @@ def parse_args():
         type=str,
         choices=["none", "median"],
         default="median",
-        help="Optuna pruner to use when --tune-backend optuna.",
+        help=(
+            "Optuna pruner when --tune-backend optuna. ``median`` uses MedianPruner with intermediate "
+            "metrics each epoch (val MAE when a val split exists). Use ``none`` to disable pruning."
+        ),
     )
     parser.add_argument(
         "--optuna-startup-trials",
@@ -150,9 +153,33 @@ def parse_args():
         default=True,
         help="Disable MIL train: inverse-frequency subject draws (use one bag per subject per epoch).",
     )
+    parser.add_argument(
+        "--mil-subject-draws-per-epoch",
+        type=int,
+        default=None,
+        help=(
+            "MIL (inverse-frequency train): number of subject pseudo-bags sampled per epoch. "
+            "Default: config or one draw per eligible train subject. Overrides MIL hyperparameter JSON."
+        ),
+    )
+    parser.add_argument(
+        "--mil-subject-draws-multiplier",
+        type=float,
+        default=None,
+        help=(
+            "MIL (inverse-frequency train): set draws/epoch = round(multiplier × train subjects with ≥1 window), "
+            "e.g. 2 for 2×. Overrides --mil-subject-draws-per-epoch and JSON."
+        ),
+    )
 
     parser.add_argument("--mil-finetune", action="store_true", help="Enable MIL Step 3 fine-tuning mode (unfreeze encoder + train full MIL model).")
-    parser.add_argument("--mil-pretrained-model", type=str, default=None, help="Optional path to pretrained CNN checkpoint used to initialize MIL encoder.")
+    parser.add_argument(
+        "--mil-pretrained-model",
+        type=str,
+        default=None,
+        help="CNN checkpoint for MIL encoder init. If omitted: MIL-only uses defaults/default_model.pt when present; "
+        "`--model-mode both` uses the CNN weights saved in the same run (after the CNN stage).",
+    )
     parser.add_argument("--mil-attention-dim", type=int, default=None, help="Hidden size for MIL gated attention head.")
     parser.add_argument("--mil-attention-dropout", type=float, default=None, help="Dropout within MIL attention head.")
     parser.add_argument("--mil-pooling-type", type=str, choices=["gated", "mean"], default=None, help="MIL bag pooling type.")
@@ -187,6 +214,25 @@ def parse_args():
     parser.add_argument("--mil-encoder-lr", type=float, default=None, help="Fine-tuning LR for pretrained CNN encoder parameters.")
     parser.add_argument("--mil-head-lr", type=float, default=None, help="Fine-tuning LR for MIL attention/predictor parameters.")
     parser.add_argument("--mil-weight-decay", type=float, default=None, help="Weight decay used by MIL fine-tuning AdamW optimizer.")
+    parser.add_argument(
+        "--mil-early-stopping-patience",
+        type=int,
+        default=None,
+        help="MIL fine-tune: epochs with no val-loss improvement before stopping (default: config mil_early_stopping_patience).",
+    )
+    parser.add_argument(
+        "--mil-early-stopping-min-epochs",
+        type=int,
+        default=None,
+        help="MIL fine-tune: minimum epochs before early stopping can trigger (default: config mil_early_stopping_min_epochs).",
+    )
+    parser.add_argument(
+        "--mil-early-stopping-monitor",
+        type=str,
+        choices=["auto", "train", "val"],
+        default="auto",
+        help="MIL fine-tune: early stopping on train loss, validation bag MAE (matches Optuna), or auto (val when a val split exists).",
+    )
     return parser.parse_args()
 
 

@@ -30,9 +30,23 @@ from cnn_age_project.config import (
     STRATIFY_AGE_BIN_YEARS,
     STRATIFY_TAIL_HIGH_MIN_AGE,
     STRATIFY_TAIL_LOW_MAX_AGE,
+    RANDOM_SEED,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _optuna_report_maybe_prune(optuna_trial, value: float, step: int) -> None:
+    """Report one intermediate value to an Optuna trial; raise TrialPruned if the pruner says stop."""
+    if optuna_trial is None:
+        return
+    try:
+        import optuna
+    except ImportError:
+        return
+    optuna_trial.report(float(value), int(step))
+    if optuna_trial.should_prune():
+        raise optuna.TrialPruned()
 
 
 def prepare_mil_instance_encoder(
@@ -395,6 +409,14 @@ def run_mil_finetune_training(
     stratify_tail_low_max_age: float | None = None,
     stratify_tail_high_min_age: float | None = None,
     stratify_age_bin_years: float | None = None,
+    val_indices=None,
+    subject_codes=None,
+    n_subjects: int = 0,
+    mil_early_stopping_monitor: str = "auto",
+    mil_val_eval_seed: int | None = None,
+    mil_eval_batch_size: int | None = None,
+    optuna_trial=None,
+    optuna_report_step_offset: int = 0,
 ):
     """Run Step 3 full-model fine-tuning over stochastic pseudo-bags.
 
@@ -440,6 +462,14 @@ def run_mil_finetune_training(
         stratify_tail_low_max_age (float | None): Age stratum boundary (None = config).
         stratify_tail_high_min_age (float | None): Old tail boundary (None = config).
         stratify_age_bin_years (float | None): Interior bin width (None = config).
+        val_indices (np.ndarray | None): Validation window indices; when set, val metrics are computed each epoch.
+        subject_codes: Subject code per memmap row (required for val eval).
+        n_subjects (int): Length of subject codebook.
+        mil_early_stopping_monitor (str): ``auto``, ``train``, or ``val`` (val = bag MAE on val split, matches Optuna).
+        mil_val_eval_seed (int | None): Fixed seed for val pseudo-bag sampling each epoch.
+        mil_eval_batch_size (int | None): MIL eval batch size (default: ``bag_batch_size``).
+        optuna_trial: When set (tuning), report one metric per epoch for Optuna pruners.
+        optuna_report_step_offset (int): Added to the epoch index in ``trial.report`` (e.g. CNN epochs in joint tuning).
 
     Returns:
         dict[str, Any]: Fine-tuning history and best-epoch metadata.
@@ -447,10 +477,35 @@ def run_mil_finetune_training(
     train_losses = []
     maes = []
     r2_scores = []
-    best_loss = float("inf")
+    val_maes: list[float] = []
+    val_losses: list[float] = []
+    best_monitor = float("inf")
     best_epoch = 0
     best_state_dict = None
     epochs_without_improvement = 0
+    monitor_label = "train_loss"
+
+    has_val = val_indices is not None and getattr(val_indices, "size", 0) > 0
+    if has_val and (subject_codes is None or int(n_subjects) <= 0):
+        logger.warning(
+            "MIL validation indices present but subject_codes/n_subjects invalid; skipping val metrics per epoch."
+        )
+        has_val = False
+    resolved_monitor = (mil_early_stopping_monitor or "auto").strip().lower()
+    if resolved_monitor == "auto":
+        resolved_monitor = "val" if has_val else "train"
+    elif resolved_monitor == "val" and not has_val:
+        logger.warning(
+            "MIL early stopping monitor=val requested but no validation split; using train loss."
+        )
+        resolved_monitor = "train"
+    monitor_label = "val_mae" if resolved_monitor == "val" else "train_loss"
+    if has_val and resolved_monitor == "val":
+        logger.info(
+            "MIL early stopping uses validation bag MAE (same protocol as Optuna MIL tuning)."
+        )
+    eval_bs = int(mil_eval_batch_size) if mil_eval_batch_size is not None else int(bag_batch_size)
+    val_seed = int(mil_val_eval_seed) if mil_val_eval_seed is not None else int(RANDOM_SEED) + 4242
 
     use_mil_if = (
         MIL_INVERSE_FREQUENCY_SUBJECT_SAMPLING
@@ -612,23 +667,77 @@ def run_mil_finetune_training(
         maes.append(mae)
         r2_scores.append(r2)
 
-        logger.info(
-            "MIL epoch %d/%d | loss=%.4f mae=%.3f r2=%.4f",
-            epoch + 1,
-            epochs,
-            avg_loss,
-            mae,
-            r2,
-        )
+        val_mae_epoch = float("nan")
+        val_loss_epoch = float("nan")
+        if has_val and subject_codes is not None:
+            mil_model.eval()
+            val_rng = np.random.default_rng(val_seed)
+            val_metrics = evaluate_mil_on_subject_bags(
+                mil_model=mil_model,
+                criterion=criterion,
+                x_mem=x_mem,
+                y_mem=y_mem,
+                eval_indices=val_indices,
+                subject_codes=subject_codes,
+                n_subjects=int(n_subjects),
+                batch_size=eval_bs,
+                device=device,
+                x_mean=x_mean,
+                x_std=x_std,
+                y_mean=y_mean,
+                y_std=y_std,
+                normalize_target=normalize_target,
+                rng=val_rng,
+                pseudo_bag_min_windows=pseudo_bag_min_windows,
+                pseudo_bag_max_windows=pseudo_bag_max_windows,
+                allow_replacement_when_small=allow_replacement_when_small,
+                sampling_strategy=sampling_strategy,
+            )
+            val_mae_epoch = float(val_metrics["test_mae"])
+            val_loss_epoch = float(val_metrics["test_loss"])
+            val_maes.append(val_mae_epoch)
+            val_losses.append(val_loss_epoch)
+            mil_model.train()
+
+        monitor_value = val_mae_epoch if resolved_monitor == "val" else avg_loss
+        if has_val and subject_codes is not None:
+            logger.info(
+                "MIL epoch %d/%d | loss=%.4f mae=%.3f r2=%.4f | val_mae=%.4f val_loss=%.4f",
+                epoch + 1,
+                epochs,
+                avg_loss,
+                mae,
+                r2,
+                val_mae_epoch,
+                val_loss_epoch,
+            )
+        else:
+            logger.info(
+                "MIL epoch %d/%d | loss=%.4f mae=%.3f r2=%.4f",
+                epoch + 1,
+                epochs,
+                avg_loss,
+                mae,
+                r2,
+            )
+
+        if optuna_trial is not None:
+            if has_val and resolved_monitor == "val" and np.isfinite(val_mae_epoch):
+                rpt_mil = float(val_mae_epoch)
+            elif resolved_monitor == "train":
+                rpt_mil = float(avg_loss)
+            else:
+                rpt_mil = float(mae)
+            _optuna_report_maybe_prune(optuna_trial, rpt_mil, optuna_report_step_offset + epoch)
 
         improvement_threshold = max(
             early_stopping_min_delta_abs,
-            abs(best_loss) * early_stopping_min_delta_rel if np.isfinite(best_loss) else 0.0,
+            abs(best_monitor) * early_stopping_min_delta_rel if np.isfinite(best_monitor) else 0.0,
         )
-        improved = (best_loss - avg_loss) > improvement_threshold
+        improved = (best_monitor - monitor_value) > improvement_threshold
 
-        if improved or not np.isfinite(best_loss):
-            best_loss = avg_loss
+        if improved or not np.isfinite(best_monitor):
+            best_monitor = monitor_value
             best_epoch = epoch + 1
             epochs_without_improvement = 0
             best_state_dict = {key: value.detach().cpu().clone() for key, value in mil_model.state_dict().items()}
@@ -641,10 +750,11 @@ def run_mil_finetune_training(
             and epochs_without_improvement >= early_stopping_patience
         ):
             logger.info(
-                "MIL early stopping at epoch %d (best epoch: %d, best loss: %.4f).",
+                "MIL early stopping at epoch %d (best epoch: %d, best %s: %.4f).",
                 epoch + 1,
                 best_epoch,
-                best_loss,
+                monitor_label,
+                best_monitor,
             )
             break
 
@@ -652,13 +762,27 @@ def run_mil_finetune_training(
         mil_model.load_state_dict(best_state_dict)
         logger.info("MIL restored best weights (epoch %d).", best_epoch)
 
+    best_train_at_best = float(train_losses[best_epoch - 1]) if 0 < best_epoch <= len(train_losses) else float("nan")
+    best_val_mae_at_best = (
+        float(val_maes[best_epoch - 1])
+        if has_val and 0 < best_epoch <= len(val_maes) and len(val_maes) == len(train_losses)
+        else float("nan")
+    )
+
     return {
         "model": mil_model,
         "train_losses": train_losses,
+        "val_losses": val_losses,
+        "val_maes": val_maes,
         "maes": maes,
         "r2_scores": r2_scores,
-        "best_loss": best_loss,
+        "best_loss": best_train_at_best,
         "best_epoch": best_epoch,
+        "best_monitor_value": float(best_monitor),
+        "mil_early_stopping_monitor": resolved_monitor,
+        "best_val_mae_at_best_epoch": float(best_val_mae_at_best)
+        if np.isfinite(best_val_mae_at_best)
+        else None,
     }
 
 
@@ -784,6 +908,140 @@ def evaluate_mil_on_subject_bags(
     }
 
 
+def mil_best_bag_attention_snapshot(
+    mil_model,
+    x_mem,
+    y_mem,
+    eval_indices,
+    subject_codes,
+    n_subjects,
+    batch_size,
+    device,
+    x_mean,
+    x_std,
+    y_mean,
+    y_std,
+    normalize_target,
+    pseudo_bag_min_windows,
+    pseudo_bag_max_windows,
+    allow_replacement_when_small,
+    sampling_strategy,
+    diagnostic_seed: int = 42,
+    subject_codebook: list[str] | None = None,
+):
+    """Pick the eval pseudo-bag with lowest absolute age error and return attention diagnostics.
+
+    Uses a dedicated RNG seed so the pseudo-bag draw is reproducible (independent of
+    other pipeline RNG consumption). "Best" means smallest |bag_pred - true_age| among
+    those bags.
+
+    Args:
+        mil_model: Trained ``MILAgeRegressor``.
+        subject_codebook: Optional subject id strings indexed by subject code.
+
+    Returns:
+        dict[str, Any]: Numpy arrays and metadata for plotting, or empty dict on failure.
+    """
+    from cnn_age_project.data.dataset import build_subject_group_index  # local import avoids cycles
+
+    mil_model.eval()
+    diag_rng = np.random.default_rng(int(diagnostic_seed))
+
+    sorted_idx, offsets, counts = build_subject_group_index(
+        train_indices=eval_indices,
+        subject_codes=subject_codes,
+        n_subjects=n_subjects,
+    )
+
+    pseudo_bags = sample_mil_epoch_pseudo_bags(
+        balanced_sorted_indices=sorted_idx,
+        balanced_offsets=offsets,
+        balanced_counts=counts,
+        rng=diag_rng,
+        pseudo_bag_min_windows=pseudo_bag_min_windows,
+        pseudo_bag_max_windows=pseudo_bag_max_windows,
+        allow_replacement_when_small=allow_replacement_when_small,
+        sampling_strategy=sampling_strategy,
+    )
+    if len(pseudo_bags) == 0:
+        return {}
+
+    batch_iter = build_mil_pseudo_bag_batch_iterator(
+        x_mem=x_mem,
+        y_mem=y_mem,
+        pseudo_bags=pseudo_bags,
+        batch_size=batch_size,
+        x_mean=x_mean,
+        x_std=x_std,
+    )
+
+    best_err = float("inf")
+    best_payload = None
+
+    with torch.no_grad():
+        for x_bags, y_bags, bag_subject_codes, bag_mask in batch_iter:
+            x_bags = x_bags.to(device, non_blocking=True)
+            y_bags = y_bags.to(device, non_blocking=True)
+            bag_mask = bag_mask.to(device, non_blocking=True)
+
+            outputs = mil_model(x_bags, bag_mask=bag_mask)
+            outputs_year = outputs * y_std + y_mean if normalize_target else outputs
+            outputs_year = clip_predicted_ages_in_years(outputs_year)
+            errors = torch.abs(outputs_year - y_bags)
+
+            for i in range(x_bags.shape[0]):
+                err = float(errors[i].item())
+                if err < best_err:
+                    best_err = err
+                    best_payload = (
+                        x_bags[i : i + 1].detach(),
+                        bag_mask[i : i + 1].detach(),
+                        int(bag_subject_codes[i]),
+                        float(y_bags[i].item()),
+                    )
+
+    if best_payload is None:
+        return {}
+
+    x_one, mask_one, subj_code, true_age = best_payload
+    with torch.no_grad():
+        diag = mil_model.analyze_bag(
+            x_one,
+            bag_mask=mask_one,
+            y_mean=float(y_mean),
+            y_std=float(y_std),
+            normalize_target=normalize_target,
+        )
+
+    att_np = diag["attention_weights"].float().cpu().numpy().squeeze(0)
+    inst_age = diag["instance_prediction_years"].float().cpu().numpy().squeeze(0)
+    bag_pred = float(diag["bag_prediction_years"].float().cpu().numpy().squeeze())
+
+    mask_np = mask_one.squeeze(0).cpu().numpy().astype(bool)
+    if not np.any(mask_np):
+        return {}
+
+    att_np = att_np[mask_np]
+    inst_age = inst_age[mask_np]
+    idx = np.nonzero(mask_np)[0].astype(np.int32)
+
+    subj_id = None
+    if subject_codebook is not None and 0 <= subj_code < len(subject_codebook):
+        subj_id = str(subject_codebook[subj_code])
+
+    return {
+        "subject_code": subj_code,
+        "subject_id": subj_id,
+        "true_age_years": true_age,
+        "bag_prediction_years": bag_pred,
+        "abs_error": abs(bag_pred - true_age),
+        "instance_prediction_years": inst_age,
+        "attention_weights": att_np,
+        "window_index": idx,
+        "diagnostic_seed": int(diagnostic_seed),
+    }
+
+
 def setup_model_and_optimizers(
     window_len,
     device,
@@ -890,6 +1148,7 @@ def run_tuning_trial(
     train_window_sample_weights=None,
     use_age_weighted_window_sampling=False,
     cnn_samples_per_epoch=None,
+    optuna_trial=None,
 ):
     """Train a short trial with candidate hyperparameters and return held-out metrics.
 
@@ -925,6 +1184,7 @@ def run_tuning_trial(
         debug_chunk_log_every (int): Debug logging cadence.
         plot_max_points (int): Max plotted points for eval metric helper.
         cnn_samples_per_epoch (int | None): Age-weighted draws per epoch; ``None``/``<=0`` = full train pool.
+        optuna_trial: When set, report validation MAE (or train loss if no val) each epoch for pruning.
 
     Returns:
         dict[str, float | dict]: Trial metrics and hyperparameters.
@@ -1032,7 +1292,35 @@ def run_tuning_trial(
             running_train_loss += float(loss.item())
             batch_bar.set_postfix(loss=f"{loss.item():.4f}")
 
-        epoch_bar.set_postfix(avg_loss=f"{(running_train_loss / max(1, n_batches)):.4f}")
+        epoch_avg_loss = running_train_loss / max(1, n_batches)
+        epoch_bar.set_postfix(avg_loss=f"{epoch_avg_loss:.4f}")
+
+        if optuna_trial is not None:
+            if val_indices is not None and val_indices.size > 0:
+                _, _, vm_ep, _, _, _, _, _ = run_epoch_metrics(
+                    model=model,
+                    x_mem=x_mem,
+                    y_mem=y_mem,
+                    indices=val_indices,
+                    batch_size=batch_size,
+                    device=device,
+                    criterion=criterion,
+                    amp_enabled=amp_enabled,
+                    subject_codes=None,
+                    n_subjects=0,
+                    x_mean=x_mean,
+                    x_std=x_std,
+                    y_mean=y_mean,
+                    y_std=y_std,
+                    normalize_target=normalize_target,
+                    plot_max_points=0,
+                    debug_chunk_log_every=debug_chunk_log_every,
+                    eval_label="Val Eval",
+                )
+                rpt_cnn = float(vm_ep)
+            else:
+                rpt_cnn = float(epoch_avg_loss)
+            _optuna_report_maybe_prune(optuna_trial, rpt_cnn, epoch_idx)
 
     test_loss, test_r2, test_mae, _, _, _, _, _ = run_epoch_metrics(
         model=model,
@@ -1178,6 +1466,8 @@ def train_model(
         dict[str, Any]: Trained model plus loss/metric histories and best-epoch metadata.
     """
     train_losses = []
+    val_losses: list[float] = []
+    val_maes: list[float] = []
     r2_scores = []
     maes = []
     best_loss = float("inf")
@@ -1340,6 +1630,8 @@ def train_model(
             )
             val_loss = val_result[0]
             val_mae = val_result[2]
+            val_losses.append(float(val_loss))
+            val_maes.append(float(val_mae))
             logger.info(
                 "Epoch %d/%d | train_loss=%.4f val_loss=%.4f val_mae=%.2f",
                 epoch + 1,
@@ -1391,6 +1683,8 @@ def train_model(
     return {
         "model": model,
         "train_losses": train_losses,
+        "val_losses": val_losses,
+        "val_maes": val_maes,
         "r2_scores": r2_scores,
         "maes": maes,
         "best_loss": best_loss,

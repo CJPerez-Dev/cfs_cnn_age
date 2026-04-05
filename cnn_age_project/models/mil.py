@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 
 from cnn_age_project.models.cnn_model import EEGCNN
+from cnn_age_project.utils.age_predictions import clip_predicted_ages_in_years
 
 logger = logging.getLogger(__name__)
 
@@ -329,6 +330,76 @@ class MILAgeRegressor(nn.Module):
         if return_attention:
             return predictions, attention_weights, attention_logits, bag_embedding
         return predictions
+
+    def analyze_bag(
+        self,
+        bag_windows: torch.Tensor,
+        bag_mask: torch.Tensor | None = None,
+        y_mean: float = 0.0,
+        y_std: float = 1.0,
+        normalize_target: bool = True,
+    ) -> dict[str, torch.Tensor]:
+        """Diagnostics for one or more bags: attention and per-instance regressor outputs.
+
+        Per-instance ages apply the **same** bag regressor to each instance embedding
+        (not trained as instance predictors; useful for attention visualization).
+
+        Args:
+            bag_windows: ``(batch, n_instances, 1, window_len)``.
+            bag_mask: Optional ``(batch, n_instances)`` boolean mask.
+            y_mean: Target mean for denormalization.
+            y_std: Target std for denormalization.
+            normalize_target: Whether training used normalized targets.
+
+        Returns:
+            Dict with ``bag_prediction_years``, ``instance_prediction_years``,
+            ``attention_weights``, ``attention_logits``, ``bag_embedding``.
+        """
+        instance_embeddings = self.encode_bag_instances(bag_windows)
+        batch_size, n_instances, feat_dim = instance_embeddings.shape
+
+        if self.pooling_type == "mean":
+            if bag_mask is None:
+                bag_embedding = torch.mean(instance_embeddings, dim=1)
+                attention_weights = torch.full(
+                    (batch_size, n_instances),
+                    1.0 / max(1, n_instances),
+                    device=instance_embeddings.device,
+                    dtype=instance_embeddings.dtype,
+                )
+            else:
+                mask = bag_mask.to(instance_embeddings.dtype).unsqueeze(-1)
+                valid = torch.clamp(mask.sum(dim=1), min=1.0)
+                bag_embedding = (instance_embeddings * mask).sum(dim=1) / valid
+                attention_weights = mask.squeeze(-1) / valid
+            attention_logits = attention_weights
+        else:
+            bag_embedding, attention_weights, attention_logits = self.attention_head(
+                instance_embeddings,
+                bag_mask=bag_mask,
+            )
+
+        bag_raw = self.bag_regressor(bag_embedding).squeeze(-1)
+        inst_flat = instance_embeddings.reshape(batch_size * n_instances, feat_dim)
+        instance_raw = self.bag_regressor(inst_flat).squeeze(-1).reshape(batch_size, n_instances)
+
+        if normalize_target:
+            bag_years = bag_raw * y_std + y_mean
+            inst_years = instance_raw * y_std + y_mean
+        else:
+            bag_years = bag_raw
+            inst_years = instance_raw
+
+        bag_years = clip_predicted_ages_in_years(bag_years)
+        inst_years = clip_predicted_ages_in_years(inst_years)
+
+        return {
+            "bag_prediction_years": bag_years,
+            "instance_prediction_years": inst_years,
+            "attention_weights": attention_weights,
+            "attention_logits": attention_logits,
+            "bag_embedding": bag_embedding,
+        }
 
     def set_encoder_trainable(self, trainable: bool) -> None:
         """Toggle whether the instance encoder participates in gradient updates.
