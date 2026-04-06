@@ -239,25 +239,9 @@ def save_subject_examples_report(run_output_dir, run_tag, subject_report_save_na
     return subject_report_path
 
 
-def save_model_comparison_report(run_output_dir, run_tag, cnn_summary, mil_summary):
-    """Save a metric comparison chart for Baseline vs CNN vs MIL.
-
-    Includes window-level test metrics and subject-level test metrics when present
-    in the run summaries (``subject_mae``, ``subject_r2``).
-
-    Args:
-        run_output_dir (str): Output directory for comparison artifacts.
-        run_tag (str): Timestamp tag used in output filename.
-        cnn_summary (dict[str, Any]): Summary payload for baseline CNN run.
-        mil_summary (dict[str, Any]): Summary payload for MIL run.
-
-    Returns:
-        str: Saved comparison figure path.
-    """
-    # Use the baseline metrics stored in the per-run summary (baseline is the
-    # constant train-mean age predictor). Baseline should be identical for CNN
-    # and MIL runs given the same split; we take it from the CNN summary.
-    baseline = {
+def _model_comparison_baseline_dict(cnn_summary):
+    """Baseline = constant train-mean age predictor (shared split; from CNN summary)."""
+    return {
         "test_loss": float(cnn_summary.get("baseline_loss", np.nan)),
         "test_mae": float(cnn_summary.get("baseline_mae", np.nan)),
         "test_r2": float(cnn_summary.get("baseline_r2", np.nan)),
@@ -265,42 +249,16 @@ def save_model_comparison_report(run_output_dir, run_tag, cnn_summary, mil_summa
         "subject_r2": float(cnn_summary.get("baseline_r2", np.nan)),
     }
 
-    metrics = [
-        ("Test Loss (MSE)", "test_loss", False),
-        ("Test MAE (window)", "test_mae", False),
-        ("Subject MAE", "subject_mae", False),
-        ("Test R² (window)", "test_r2", True),
-        ("Subject R²", "subject_r2", True),
-    ]
 
-    baseline_values = [float(baseline.get(key, np.nan)) for _, key, _ in metrics]
-    cnn_values = [float(cnn_summary.get(key, np.nan)) for _, key, _ in metrics]
-    mil_values = [float(mil_summary.get(key, np.nan)) for _, key, _ in metrics]
-    labels = [name for name, _, _ in metrics]
-
-    x = np.arange(len(metrics), dtype=np.float32)
-    width = 0.25
-
-    fig, ax = plt.subplots(figsize=(14, 6))
-    ax.bar(x - width, baseline_values, width, label="Baseline", color="#BAB0AC")
-    ax.bar(x, cnn_values, width, label="CNN", color="#4E79A7")
-    ax.bar(x + width, mil_values, width, label="CNN + MIL", color="#F28E2B")
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=15, ha="right")
-    ax.set_ylabel("Metric Value")
-    ax.set_title("Baseline vs CNN vs CNN+MIL (window + subject test metrics)")
-    ax.grid(True, axis="y", alpha=0.3)
-    ax.legend(loc="best")
-
-    summary_lines = []
+def _model_comparison_gain_lines(metrics, baseline, cnn_summary, mil_summary):
+    """One text line per metric: values + which model improves more over baseline."""
+    lines = []
     for label, key, higher_is_better in metrics:
         b_v = float(baseline.get(key, np.nan))
         cnn_v = float(cnn_summary.get(key, np.nan))
         mil_v = float(mil_summary.get(key, np.nan))
         if not (np.isfinite(b_v) and np.isfinite(cnn_v) and np.isfinite(mil_v)):
             continue
-        # Compare improvements over baseline for each model.
         if higher_is_better:
             cnn_gain = cnn_v - b_v
             mil_gain = mil_v - b_v
@@ -308,9 +266,128 @@ def save_model_comparison_report(run_output_dir, run_tag, cnn_summary, mil_summa
             cnn_gain = b_v - cnn_v
             mil_gain = b_v - mil_v
         winner = "CNN+MIL" if mil_gain > cnn_gain else ("CNN" if cnn_gain > mil_gain else "Tie")
-        summary_lines.append(
+        lines.append(
             f"{label}: baseline={b_v:.4f} | CNN={cnn_v:.4f} | CNN+MIL={mil_v:.4f} | better={winner}"
         )
+    return lines
+
+
+def _draw_model_comparison_bars_on_ax(
+    ax,
+    metrics,
+    baseline,
+    cnn_summary,
+    mil_summary,
+    y_axis_label,
+    title,
+):
+    """Draw grouped bars on ``ax``; return summary text lines for this metric set."""
+    baseline_values = [float(baseline.get(key, np.nan)) for _, key, _ in metrics]
+    cnn_values = [float(cnn_summary.get(key, np.nan)) for _, key, _ in metrics]
+    mil_values = [float(mil_summary.get(key, np.nan)) for _, key, _ in metrics]
+    labels = [name for name, _, _ in metrics]
+
+    x = np.arange(len(metrics), dtype=np.float32)
+    width = 0.25
+    ax.bar(x - width, baseline_values, width, label="Baseline", color="#BAB0AC")
+    ax.bar(x, cnn_values, width, label="CNN", color="#4E79A7")
+    ax.bar(x + width, mil_values, width, label="CNN + MIL", color="#F28E2B")
+
+    ax.set_xticks(x)
+    if len(metrics) == 1:
+        ax.set_xticklabels(labels, rotation=0, ha="center")
+    else:
+        ax.set_xticklabels(labels, rotation=12, ha="right")
+    ax.set_ylabel(y_axis_label)
+    ax.set_title(title)
+    ax.grid(True, axis="y", alpha=0.3)
+    return _model_comparison_gain_lines(metrics, baseline, cnn_summary, mil_summary)
+
+
+def _save_model_comparison_loss_and_mae_figure(
+    run_output_dir,
+    run_tag,
+    baseline,
+    cnn_summary,
+    mil_summary,
+):
+    """Two subplots: test MSE (loss) | window MAE + subject MAE (separate y-scales)."""
+    loss_metrics = [
+        ("Test MSE (loss)", "test_loss", False),
+    ]
+    mae_metrics = [
+        ("Window MAE", "test_mae", False),
+        ("Subject MAE", "subject_mae", False),
+    ]
+
+    fig, (ax_loss, ax_mae) = plt.subplots(1, 2, figsize=(14, 5.5))
+    lines_loss = _draw_model_comparison_bars_on_ax(
+        ax_loss,
+        loss_metrics,
+        baseline,
+        cnn_summary,
+        mil_summary,
+        "MSE (years²)",
+        "Test MSE — window-level",
+    )
+    lines_mae = _draw_model_comparison_bars_on_ax(
+        ax_mae,
+        mae_metrics,
+        baseline,
+        cnn_summary,
+        mil_summary,
+        "MAE (years)",
+        "MAE — window-level vs subject-level",
+    )
+
+    for ax, lines in ((ax_loss, lines_loss), (ax_mae, lines_mae)):
+        ax.legend(
+            loc="center left",
+            bbox_to_anchor=(1.02, 0.5),
+            borderaxespad=0,
+            framealpha=0.95,
+        )
+        if lines:
+            ax.text(
+                0.01,
+                0.99,
+                "\n".join(lines),
+                transform=ax.transAxes,
+                verticalalignment="top",
+                fontsize=8,
+                bbox=dict(facecolor="white", alpha=0.85),
+            )
+
+    plt.tight_layout()
+    path = os.path.join(run_output_dir, f"cnn_mil_comparison_mae_{run_tag}.png")
+    plt.savefig(path, dpi=300, bbox_inches="tight", pad_inches=0.2)
+    logger.info("CNN vs MIL comparison report saved to: %s", path)
+    plt.close(fig)
+    return path
+
+
+def _save_model_comparison_bar_figure(
+    run_output_dir,
+    run_tag,
+    filename_suffix,
+    plot_title,
+    y_axis_label,
+    metrics,
+    baseline,
+    cnn_summary,
+    mil_summary,
+):
+    """Draw grouped bars (Baseline / CNN / CNN+MIL) for a list of metric keys."""
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    summary_lines = _draw_model_comparison_bars_on_ax(
+        ax, metrics, baseline, cnn_summary, mil_summary, y_axis_label, plot_title
+    )
+    ax.legend(
+        loc="center left",
+        bbox_to_anchor=(1.02, 0.5),
+        borderaxespad=0,
+        framealpha=0.95,
+    )
 
     if summary_lines:
         ax.text(
@@ -324,8 +401,54 @@ def save_model_comparison_report(run_output_dir, run_tag, cnn_summary, mil_summa
         )
 
     plt.tight_layout()
-    path = os.path.join(run_output_dir, f"cnn_mil_comparison_{run_tag}.png")
-    plt.savefig(path, dpi=300)
+    path = os.path.join(run_output_dir, f"cnn_mil_comparison_{filename_suffix}_{run_tag}.png")
+    plt.savefig(path, dpi=300, bbox_inches="tight", pad_inches=0.2)
     logger.info("CNN vs MIL comparison report saved to: %s", path)
     plt.close(fig)
     return path
+
+
+def save_model_comparison_report(run_output_dir, run_tag, cnn_summary, mil_summary):
+    """Save loss/MAE and R² comparison charts (Baseline vs CNN vs CNN+MIL).
+
+    Writes:
+
+    - ``cnn_mil_comparison_mae_<run_tag>.png``: two panels — **test MSE (loss)** on the
+      left, **window MAE + subject MAE** on the right (separate y-axes so MSE does not
+      compress the MAE bars).
+    - ``cnn_mil_comparison_r2_<run_tag>.png``: **subject-level R²** only.
+
+    Args:
+        run_output_dir (str): Output directory for comparison artifacts.
+        run_tag (str): Timestamp tag used in output filename.
+        cnn_summary (dict[str, Any]): Summary payload for baseline CNN run.
+        mil_summary (dict[str, Any]): Summary payload for MIL run.
+
+    Returns:
+        tuple[str, str]: ``(mae_bundle_png_path, r2_png_path)``.
+    """
+    baseline = _model_comparison_baseline_dict(cnn_summary)
+
+    r2_metrics = [
+        ("Subject-level R²", "subject_r2", True),
+    ]
+
+    mae_path = _save_model_comparison_loss_and_mae_figure(
+        run_output_dir,
+        run_tag,
+        baseline,
+        cnn_summary,
+        mil_summary,
+    )
+    r2_path = _save_model_comparison_bar_figure(
+        run_output_dir,
+        run_tag,
+        "r2",
+        "Subject-level R²: Baseline vs CNN vs CNN+MIL",
+        "R²",
+        r2_metrics,
+        baseline,
+        cnn_summary,
+        mil_summary,
+    )
+    return mae_path, r2_path

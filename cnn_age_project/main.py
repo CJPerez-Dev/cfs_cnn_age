@@ -22,7 +22,9 @@ def parse_args():
     Returns:
         argparse.Namespace: Parsed CLI arguments containing tuning options.
     """
-    parser = argparse.ArgumentParser(description="EEG CNN age prediction with optional hyperparameter tuning")
+    parser = argparse.ArgumentParser(
+        description="EEG age regression: CNN encoder + MIL subject-level model (optional CNN-only or MIL-only runs)."
+    )
     parser.add_argument("--tune", action="store_true", help="Enable hyperparameter tuning mode before final training")
     parser.add_argument(
         "--tune-and-train",
@@ -35,8 +37,8 @@ def parse_args():
         "--tune-backend",
         type=str,
         choices=["grid", "optuna"],
-        default="grid",
-        help="Hyperparameter tuner backend. 'grid' uses shuffled candidate search, 'optuna' uses adaptive search.",
+        default="optuna",
+        help="Hyperparameter tuner backend (default: optuna). Use 'grid' for shuffled grid search.",
     )
     parser.add_argument(
         "--optuna-sampler",
@@ -102,14 +104,20 @@ def parse_args():
         "--model-mode",
         type=str,
         choices=["cnn", "mil", "both"],
-        default="cnn",
-        help="Select execution mode: baseline CNN only, MIL only, or both back-to-back with comparison artifacts.",
+        default="both",
+        help=(
+            "Default `both`: train CNN then MIL (same run; subject-level prediction + CNN vs MIL comparison). "
+            "`cnn` = window-level encoder only; `mil` = MIL fine-tune from --mil-pretrained-model or defaults/default_model.pt."
+        ),
     )
     parser.add_argument(
         "--validation-key",
         type=str,
         default=None,
-        help="Optional validation subject key CSV filename (e.g. AgeValidation_Key.csv) in input/. When set, a validation set is used for early stopping and LR scheduling.",
+        help=(
+            "Legacy (--no-auto-split) only: validation subject key CSV in input/ (e.g. AgeValidation_Key.csv). "
+            "Ignored when auto-split is on (val fold comes from 70/15/15)."
+        ),
     )
     parser.add_argument(
         "--auto-split",
@@ -248,8 +256,7 @@ def run():
     configure_logging(LOG_LEVEL)
     args = parse_args()
 
-    # Backward compatibility: if legacy flag is set and model-mode was left at
-    # default CNN, switch to MIL mode.
+    # Backward compatibility: legacy `--mil-finetune` used to imply MIL-only when the old default was `cnn`.
     if args.mil_finetune and args.model_mode == "cnn":
         args.model_mode = "mil"
 

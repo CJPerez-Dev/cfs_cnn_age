@@ -189,7 +189,7 @@ def save_best_hyperparameters(path, hparams, tuning_results=None):
         logger.info("Saved tuning trial results to: %s", results_path)
 
 
-def build_tuning_candidates(defaults, model_mode="cnn"):
+def build_tuning_candidates(defaults, model_mode="both"):
     """Generate a model-mode aware hyperparameter candidate grid.
 
     Args:
@@ -277,7 +277,7 @@ def build_tuning_candidates(defaults, model_mode="cnn"):
     return candidates
 
 
-def build_optuna_candidate(defaults, trial, model_mode="cnn"):
+def build_optuna_candidate(defaults, trial, model_mode="both"):
     """Build one hyperparameter candidate from an Optuna trial.
 
     Args:

@@ -1087,8 +1087,8 @@ def select_hyperparameters(args, data_ctx: DataContext, norm_ctx: NormalizationC
 
     log_stage("Hyperparameter Selection", logger)
     if args.tune:
-        mode_for_tune = str(getattr(args, "model_mode", "cnn") or "cnn")
-        tune_backend = str(getattr(args, "tune_backend", "grid") or "grid").lower()
+        mode_for_tune = str(getattr(args, "model_mode", "both") or "both")
+        tune_backend = str(getattr(args, "tune_backend", "optuna") or "optuna").lower()
         max_trials = int(args.tune_max_trials)
         logger.info(
             "Hyperparameter tuning enabled | mode=%s | backend=%s | trials=%d | tune_epochs=%d",
@@ -2240,15 +2240,16 @@ def execute_full_workflow(args):
             cnn_summary=model_summaries["cnn"],
             mil_summary=model_summaries["mil"],
         )
-        comparison_plot = save_model_comparison_report(
+        comparison_plot_mae, comparison_plot_r2 = save_model_comparison_report(
             run_output_dir=run_ctx.run_output_dir,
             run_tag=run_ctx.run_tag,
             cnn_summary=model_summaries["cnn"],
             mil_summary=model_summaries["mil"],
         )
         logger.info(
-            "CNN vs MIL comparison artifacts saved | txt=%s | json=%s | plot=%s",
+            "CNN vs MIL comparison artifacts saved | txt=%s | json=%s | plot_mae=%s | plot_r2=%s",
             comparison_txt,
             comparison_json,
-            comparison_plot,
+            comparison_plot_mae,
+            comparison_plot_r2,
         )

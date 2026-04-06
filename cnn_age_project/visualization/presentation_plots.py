@@ -179,17 +179,25 @@ def _plot_metric_bars(
     bar_series(width, mil_summary, "CNN + MIL", "#F28E2B")
 
     ax.set_xticks(x + width / 2)
-    ax.set_xticklabels([m[0] for m in metrics], rotation=12, ha="right")
+    if n_met == 1:
+        ax.set_xticklabels([m[0] for m in metrics], rotation=0, ha="center")
+    else:
+        ax.set_xticklabels([m[0] for m in metrics], rotation=12, ha="right")
     ax.set_ylabel(ylabel)
     ax.set_title(title + (" vs baseline" if include_baseline else ""))
     ax.grid(True, axis="y", alpha=0.3)
-    ax.legend(loc="best")
+    ax.legend(
+        loc="center left",
+        bbox_to_anchor=(1.02, 0.5),
+        borderaxespad=0,
+        framealpha=0.95,
+    )
 
     note = " | ".join(f"{m[0]}: {m[2]}" for m in metrics)
     ax.text(0.01, 0.99, note, transform=ax.transAxes, va="top", fontsize=8, color="#555555")
 
     fig.tight_layout()
-    fig.savefig(out_path, bbox_inches="tight")
+    fig.savefig(out_path, bbox_inches="tight", pad_inches=0.2)
     plt.close(fig)
     logger.info("Saved %s", out_path)
     return out_path
@@ -201,9 +209,8 @@ def plot_test_subject_mae_only(
     out_path: str,
     include_baseline: bool = True,
 ) -> str:
-    """Test MAE and subject MAE only (CNN vs CNN+MIL vs baseline)."""
+    """Subject-level MAE only (CNN vs CNN+MIL vs baseline)."""
     metrics = [
-        ("Test MAE (years)", "test_mae", "lower is better"),
         ("Subject MAE (years)", "subject_mae", "lower is better"),
     ]
     return _plot_metric_bars(
@@ -212,7 +219,7 @@ def plot_test_subject_mae_only(
         out_path,
         metrics,
         ylabel="MAE (years)",
-        title="Held-out MAE: CNN vs CNN+MIL",
+        title="Held-out subject-level MAE: CNN vs CNN+MIL",
         include_baseline=include_baseline,
     )
 
@@ -223,9 +230,8 @@ def plot_test_subject_r2(
     out_path: str,
     include_baseline: bool = True,
 ) -> str:
-    """Test R² and subject R² (CNN vs CNN+MIL vs constant-age baseline)."""
+    """Subject-level R² (CNN vs CNN+MIL vs constant-age baseline)."""
     metrics = [
-        ("Test R²", "test_r2", "higher is better"),
         ("Subject R²", "subject_r2", "higher is better"),
     ]
     return _plot_metric_bars(
@@ -234,7 +240,7 @@ def plot_test_subject_r2(
         out_path,
         metrics,
         ylabel="R²",
-        title="Held-out R²: CNN vs CNN+MIL",
+        title="Held-out subject-level R²: CNN vs CNN+MIL",
         include_baseline=include_baseline,
     )
 
@@ -244,15 +250,15 @@ def plot_bootstrap_mae_ci(
     mil_summary: dict[str, Any],
     out_path: str,
 ) -> str:
-    """Point estimate + bootstrap CI for test MAE (if CI present in summaries)."""
+    """Point estimate + bootstrap CI for subject-level MAE (if CI present in summaries)."""
     ci_c = cnn_summary.get("bootstrap_mae_ci")
     ci_m = mil_summary.get("bootstrap_mae_ci")
     if not (ci_c and ci_m and len(ci_c) == 2 and len(ci_m) == 2):
         logger.info("Skipping bootstrap plot: missing bootstrap_mae_ci in one or both summaries.")
         return ""
 
-    mae_c = float(cnn_summary.get("test_mae", np.nan))
-    mae_m = float(mil_summary.get("test_mae", np.nan))
+    mae_c = float(cnn_summary.get("subject_mae", np.nan))
+    mae_m = float(mil_summary.get("subject_mae", np.nan))
     if not (np.isfinite(mae_c) and np.isfinite(mae_m)):
         return ""
 
@@ -267,8 +273,8 @@ def plot_bootstrap_mae_ci(
     ax.bar(xpos, means, color=["#4E79A7", "#F28E2B"], width=0.5, yerr=yerr, capsize=6, ecolor="#333333")
     ax.set_xticks(xpos)
     ax.set_xticklabels(labels)
-    ax.set_ylabel("Test MAE (years)")
-    ax.set_title("Test MAE with bootstrap CI")
+    ax.set_ylabel("Subject MAE (years)")
+    ax.set_title("Subject-level MAE with bootstrap CI")
     ax.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
     fig.savefig(out_path, bbox_inches="tight")
